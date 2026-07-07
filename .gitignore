@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Local tooling / editor
+.claude/
+.idea/
+.vscode/
+
+# macOS
+.DS_Store
+
+# Marvin config (never commit API tokens)
+config.json
+.config/
