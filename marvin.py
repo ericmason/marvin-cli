@@ -23,6 +23,10 @@ Commands:
     marvin reorder <id1> <id2> ...  # Reorder tasks
     marvin skip-overdue             # Dismiss overdue recurring task instances
     marvin projects                 # List projects/categories
+    marvin category Priority        # List open tasks in a category/project
+    marvin category Priority -a     # ...including completed
+    marvin backlog                  # List open, unscheduled tasks (all categories)
+    marvin backlog -u               # ...uncategorized root bucket only
     marvin labels                   # List labels
     marvin setup                    # Configure API token
 """
@@ -315,6 +319,30 @@ def format_task(item):
     time_est = item.get("timeEstimate")
     time_str = f" [{time_est // 60000}m]" if time_est else ""
     return done, title, time_str, sid
+
+
+def unique_ids(items):
+    """Map each item's _id to the shortest prefix (>= 8 chars) that is unique
+    among `items`, computed over the same matchable form find_task_by_ref uses
+    (the part after '_' for recurring instances).
+
+    Marvin ids for bulk-created tasks share a long common prefix and differ only
+    at the end, so a fixed 8-char id collides. Displaying a context-unique prefix
+    keeps the shown id both readable and usable as a task ref. Genuine duplicate
+    ids fall back to the full form.
+    """
+    def matchable(i):
+        fid = i.get("_id", "")
+        return fid.split("_", 1)[-1] if "_" in fid else fid
+
+    forms = [matchable(i) for i in items]
+    out = {}
+    for item, form in zip(items, forms):
+        n = 8
+        while n < len(form) and sum(1 for f in forms if f.startswith(form[:n])) > 1:
+            n += 1
+        out[item.get("_id", "")] = form[:max(8, n)]
+    return out
 
 
 def cmd_add(args):
@@ -701,6 +729,110 @@ def cmd_labels(args):
         title = item.get("title", "Untitled")
         label_id = item.get("_id", "")[:8]
         print(f"  @ {title}  ({label_id})")
+
+
+def resolve_category(ref):
+    """Resolve a category/project by name or 8-char id prefix.
+
+    Matches, in priority order: exact (case-insensitive) title, then id prefix,
+    then title substring. Returns the matched category dict, or None after
+    printing guidance when there is no match or the match is ambiguous.
+    """
+    cats = api_request("GET", "categories", full_access=True) or []
+    ref_l = ref.lower()
+    exact = [c for c in cats if c.get("title", "").lower() == ref_l]
+    if len(exact) == 1:
+        return exact[0]
+    byid = [c for c in cats if c.get("_id", "").startswith(ref)]
+    if len(byid) == 1:
+        return byid[0]
+    subs = [c for c in cats if ref_l in c.get("title", "").lower()]
+    if len(subs) == 1:
+        return subs[0]
+    matches = exact or byid or subs
+    if not matches:
+        print(f"No category/project matching '{ref}'. Run 'marvin projects' to list them.")
+        return None
+    print(f"Ambiguous '{ref}' — matches {len(matches)}:")
+    for c in matches:
+        print(f"  # {c.get('title', 'Untitled')}  ({c.get('_id', '')[:8]})")
+    return None
+
+
+def cmd_category(args):
+    """List tasks filed in a category/project (by name or id)."""
+    ref = " ".join(args.name).strip()
+    if not ref:
+        print("Error: category name or id required")
+        sys.exit(1)
+    cat = resolve_category(ref)
+    if not cat:
+        return
+
+    items = api_request("GET", "children", {"parentId": cat["_id"]}, full_access=True) or []
+    tasks = [it for it in items if args.all or not it.get("done")]
+    # Unscheduled first, then by scheduled day ascending.
+    tasks.sort(key=lambda it: (it.get("day", "") not in ("", "unassigned"), it.get("day", "")))
+
+    title = cat.get("title", "Untitled")
+    print(f"# {title}  ({len(tasks)} {'task' if len(tasks) == 1 else 'tasks'})")
+    print("-" * 40)
+    if not tasks:
+        print("  (no tasks)")
+    uids = unique_ids(tasks)
+    for it in tasks:
+        done, ttl, time_str, _ = format_task(it)
+        day = it.get("day", "")
+        due = it.get("dueDate", "")
+        meta = f"  sched:{day}" if day and day != "unassigned" else ""
+        meta += f"  due:{due}" if due else ""
+        print(f"  {done} {ttl}{time_str}{meta}  ({uids[it.get('_id', '')]})")
+    if len(items) >= 200:
+        print("  … (200-item API cap hit — list may be truncated)")
+
+
+def cmd_backlog(args):
+    """List open, unscheduled tasks (day == unassigned) so nothing gets forgotten.
+
+    An unscheduled task lives under whatever category it is filed in (or the root
+    'unassigned' bucket if uncategorized), so this walks the root plus every
+    category/project and collects everything with no scheduled day.
+    """
+    cats = api_request("GET", "categories", full_access=True) or []
+    parents = [("(uncategorized)", "unassigned")]
+    if not args.uncategorized:
+        parents += [(c.get("title", "Untitled"), c["_id"]) for c in cats]
+
+    groups = []       # (label, [tasks])
+    truncated = []    # parents that hit the 200-item cap
+    for label, pid in parents:
+        items = api_request("GET", "children", {"parentId": pid}, full_access=True, tolerant=True) or []
+        if len(items) >= 200:
+            truncated.append(label)
+        open_unsched = [
+            it for it in items
+            if it.get("day", "unassigned") == "unassigned" and not it.get("done")
+        ]
+        if open_unsched:
+            groups.append((label, open_unsched))
+
+    total = sum(len(t) for _, t in groups)
+    if not total:
+        print("No unscheduled tasks. Backlog is clear.")
+        return
+
+    # Unique ids computed across the whole backlog so a copied id is unambiguous.
+    uids = unique_ids([it for _, tasks in groups for it in tasks])
+    print(f"Unscheduled backlog — {total} open task(s):")
+    for label, tasks in groups:
+        print(f"\n# {label}  ({len(tasks)})")
+        for it in tasks:
+            done, ttl, time_str, _ = format_task(it)
+            due = it.get("dueDate", "")
+            due_s = f"  due:{due}" if due else ""
+            print(f"  {done} {ttl}{time_str}{due_s}  ({uids[it.get('_id', '')]})")
+    if truncated:
+        print(f"\n  ⚠ 200-item API cap hit for: {', '.join(truncated)} — some tasks may be hidden.")
 
 
 def cmd_due(args):
@@ -1162,6 +1294,22 @@ Date formats for 'day' command:
     # due
     sub = subparsers.add_parser("due", help="List tasks due soon")
     sub.set_defaults(func=cmd_due)
+
+    # category
+    sub = subparsers.add_parser("category", help="List tasks in a category/project")
+    sub.add_argument("name", nargs="+", help="Category/project name or 8-char id")
+    sub.add_argument("--all", "-a", action="store_true", help="Include completed tasks")
+    sub.set_defaults(func=cmd_category)
+
+    # backlog
+    sub = subparsers.add_parser(
+        "backlog", help="List open, unscheduled tasks (nothing gets forgotten)"
+    )
+    sub.add_argument(
+        "--uncategorized", "-u", action="store_true",
+        help="Only the uncategorized root bucket (skip walking categories)",
+    )
+    sub.set_defaults(func=cmd_backlog)
 
     # reorder
     sub = subparsers.add_parser("reorder", help="Reorder today's tasks")
