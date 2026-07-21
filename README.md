@@ -10,9 +10,10 @@ It talks directly to the official Amazing Marvin API, so there's nothing to sync
 - Add tasks and subtasks with inline `+today`, `#Category`, and `@label` modifiers
 - Complete tasks and subtasks, set time estimates, and reorder by priority
 - Move/reschedule tasks to any day (natural-language dates supported)
+- **Snooze** tasks for hours or minutes — hide from today's view until a wake time (`4h`, `30m`, `tomorrow 9am`)
 - Search across tasks and subtasks
 - **`skip-overdue`** — dismiss the pile-up of overdue *recurring* task instances without marking them done and without stopping the recurrence
-- Automatic backoff/retry on API rate limits
+- Automatic backoff/retry on API rate limits and transient 5xx errors
 
 ## Requirements
 
@@ -67,7 +68,10 @@ marvin add "Deploy" -d next monday  # Schedule for a date
 
 marvin done abc123                  # Complete a task or subtask
 marvin estimate abc123 30           # Set a 30-minute estimate
-marvin move abc123 tomorrow         # Reschedule
+marvin move abc123 tomorrow         # Reschedule to another day
+marvin snooze abc123 4h             # Hide from today until 4 hours from now
+marvin unsnooze abc123              # Wake a snoozed task early
+marvin snoozed                      # List snoozed tasks with wake times
 marvin reorder id1 id2 id3          # Reorder today's tasks by priority
 marvin search groceries             # Search tasks and subtasks
 
@@ -75,6 +79,26 @@ marvin subtasks abc123              # List subtasks of a task
 marvin projects                     # List categories/projects
 marvin labels                       # List labels
 ```
+
+### Snoozing (sub-day rescheduling)
+
+`move` reschedules by whole day; `snooze` is its sub-day counterpart — it hides
+a task from today's view and brings it back after a duration or at a wake time:
+
+```bash
+marvin snooze abc123 4h             # Durations: 4h, 30m, 90min, 2h30m, 2d
+marvin snooze abc123 "4 hours"      # Natural language works too
+marvin snooze abc123 4:15pm         # Or a wake time: 9am, 16:30, noon
+marvin snooze abc123 tomorrow 9am   # A past clock time rolls to tomorrow
+marvin unsnooze abc123              # Wake it early
+marvin snoozed                      # What's snoozed, and until when
+```
+
+This is the same snooze as the app's sleepy-moon icon (it sets the task's
+`itemSnoozeTime`), so snoozes made in the CLI and the app see each other.
+Matching the app, snoozed tasks are hidden from `today`/`day` (a `💤 N snoozed`
+line shows the count) but still appear in `backlog` and `category`. Use
+`--snoozed` / `-s` on `today`/`day` to show them inline with their wake times.
 
 ### Clearing overdue recurring tasks
 

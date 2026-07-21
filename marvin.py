@@ -21,6 +21,9 @@ Commands:
     marvin completed                # List completed tasks from last 7 days
     marvin completed --days 14      # List completed tasks from last 14 days
     marvin reorder <id1> <id2> ...  # Reorder tasks
+    marvin snooze <task_id> 4h      # Hide a task from today until a wake time
+    marvin unsnooze <task_id>       # Clear a snooze
+    marvin snoozed                  # List snoozed tasks with wake times
     marvin skip-overdue             # Dismiss overdue recurring task instances
     marvin projects                 # List projects/categories
     marvin category Priority        # List open tasks in a category/project
@@ -186,7 +189,8 @@ def get_token(full_access=False):
 def api_request(method, endpoint, data=None, full_access=False, tolerant=False, max_retries=5):
     """Make an API request to Amazing Marvin.
 
-    Retries with backoff on HTTP 429 (the API's "Too Many Requests" rate limit).
+    Retries with backoff on HTTP 429 (the API's "Too Many Requests" rate limit)
+    and on 5xx responses (the API throws intermittent 500s).
     When tolerant=True, returns None on other HTTP errors instead of exiting —
     used by bulk operations where one item's failure shouldn't abort the run.
     """
@@ -213,8 +217,8 @@ def api_request(method, endpoint, data=None, full_access=False, tolerant=False, 
             return None
         except requests.exceptions.HTTPError as e:
             status = getattr(resp, "status_code", None)
-            if status == 429 and attempt < max_retries:
-                time.sleep(3 * (attempt + 1))
+            if attempt < max_retries and (status == 429 or (status or 0) >= 500):
+                time.sleep(3 * (attempt + 1) if status == 429 else 2 * (attempt + 1))
                 continue
             if tolerant:
                 return None
@@ -388,17 +392,20 @@ def cmd_add(args):
 def cmd_today(args):
     """List today's tasks."""
     date_str = parse_date(args.date) if args.date else datetime.now().strftime("%Y-%m-%d")
-    show_tasks_for_date(date_str, include_completed=args.all)
+    show_tasks_for_date(date_str, include_completed=args.all,
+                        show_snoozed=getattr(args, "snoozed", False))
 
 
 def cmd_day(args):
     """List tasks for a specific day."""
     date_input = " ".join(args.date) if args.date else "today"
     date_str = parse_date(date_input)
-    show_tasks_for_date(date_str, show_incomplete_only=args.incomplete, include_completed=args.all)
+    show_tasks_for_date(date_str, show_incomplete_only=args.incomplete, include_completed=args.all,
+                        show_snoozed=getattr(args, "snoozed", False))
 
 
-def show_tasks_for_date(date_str, show_incomplete_only=False, include_completed=False):
+def show_tasks_for_date(date_str, show_incomplete_only=False, include_completed=False,
+                        show_snoozed=False):
     """Display tasks for a given date."""
     today_items = api_request("GET", "todayItems", {"date": date_str}, full_access=True) or []
 
@@ -408,8 +415,25 @@ def show_tasks_for_date(date_str, show_incomplete_only=False, include_completed=
     else:
         items = today_items
 
+    # The Marvin app hides snoozed tasks everywhere except the master list, so
+    # hide them here too (with a count) unless --snoozed asks to show them.
+    now = datetime.now()
+    snoozed_wakes = {}
+    for item in items:
+        wake = snoozed_until(item, now)
+        if wake and not item.get("done"):
+            snoozed_wakes[item.get("_id")] = wake
+    hidden_count = 0
+    if not show_snoozed and snoozed_wakes:
+        hidden_count = len(snoozed_wakes)
+        items = [i for i in items if i.get("_id") not in snoozed_wakes]
+
     if not items:
-        print(f"No tasks scheduled for {date_str}.")
+        if hidden_count:
+            print(f"No tasks visible for {date_str}.")
+            print(f"  💤 {hidden_count} snoozed — 'marvin snoozed' to list, --snoozed to show")
+        else:
+            print(f"No tasks scheduled for {date_str}.")
         return
 
     if show_incomplete_only:
@@ -439,19 +463,23 @@ def show_tasks_for_date(date_str, show_incomplete_only=False, include_completed=
             children_by_parent[parent_id], key=lambda x: x.get("rank", 999999)
         )
 
+    def snooze_note(item):
+        wake = snoozed_wakes.get(item.get("_id"))
+        return f" 💤 until {format_wake(wake, now)}" if wake else ""
+
     print(f"Tasks for {date_str}:")
     print("-" * 40)
 
     for idx, item in enumerate(top_level, 1):
         done, title, time_str, sid = format_task(item)
-        print(f"  {idx}. {done} {title}{time_str}  ({sid})")
+        print(f"  {idx}. {done} {title}{time_str}{snooze_note(item)}  ({sid})")
 
         # Print child items (separate tasks with parentId)
         item_id = item.get("_id")
         if item_id in children_by_parent:
             for subtask in children_by_parent[item_id]:
                 done, title, time_str, sid = format_task(subtask)
-                print(f"      {done} {title}{time_str}  ({sid})")
+                print(f"      {done} {title}{time_str}{snooze_note(subtask)}  ({sid})")
 
         # Print embedded subtasks
         embedded_subtasks = item.get("subtasks", {})
@@ -466,6 +494,9 @@ def show_tasks_for_date(date_str, show_incomplete_only=False, include_completed=
                 sub_title = subtask.get("title", "Untitled")
                 sub_sid = short_id(subtask.get("_id", ""))
                 print(f"      {sub_done} {sub_title}  ({sub_sid})")
+
+    if hidden_count:
+        print(f"\n  💤 {hidden_count} snoozed — 'marvin snoozed' to list, --snoozed to show")
 
 
 def find_embedded_subtask(task_ref, items):
@@ -921,6 +952,190 @@ def cmd_move(args):
     print(f"✓ Moved '{title[:50]}' to {target_date}")
 
 
+DURATION_TOKEN = r"(\d+)\s*(d(?:ays?)?|h(?:rs?|ours?)?|m(?:ins?|inutes?)?|s(?:ecs?|econds?)?)"
+
+
+def parse_snooze_until(text, now=None):
+    """Parse a snooze duration or wake time into a local datetime.
+
+    Durations:  4h, 30m, 90min, 2h30m, 2d, 45s, "4 hours", "1 hour 30 minutes"
+    Wake times: 9am, 4:15pm, 16:30, noon, midnight, tomorrow, "tomorrow 9am"
+                (a bare clock time already past today rolls to tomorrow)
+
+    Returns a datetime, or None if the text can't be parsed.
+    """
+    now = now or datetime.now()
+    t = text.lower().strip()
+    t = re.sub(r"^(until|till|for|in)\s+", "", t)
+
+    # Duration form: one or more <number><unit> tokens
+    if re.fullmatch(rf"(?:{DURATION_TOKEN}[\s,]*)+", t):
+        total = timedelta()
+        for num, unit in re.findall(DURATION_TOKEN, t):
+            n = int(num)
+            if unit.startswith("d"):
+                total += timedelta(days=n)
+            elif unit.startswith("h"):
+                total += timedelta(hours=n)
+            elif unit.startswith("m"):
+                total += timedelta(minutes=n)
+            else:
+                total += timedelta(seconds=n)
+        return now + total
+
+    # Wake-time form: [tomorrow] [at] <clock time>
+    tomorrow = False
+    m = re.match(r"^tomorrow\b\s*", t)
+    if m:
+        tomorrow = True
+        t = t[m.end():]
+    t = re.sub(r"^at\s+", "", t)
+
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if tomorrow and not t:
+        return midnight + timedelta(days=1)
+    if t == "noon":
+        hour, minute = 12, 0
+    elif t == "midnight":
+        return midnight + timedelta(days=1 if not tomorrow else 2)
+    else:
+        # Require a colon or am/pm so a bare ambiguous number isn't a time
+        m = re.fullmatch(r"(\d{1,2}):(\d{2})\s*(am|pm)?|(\d{1,2})\s*(am|pm)", t)
+        if not m:
+            return None
+        if m.group(1) is not None:
+            hour, minute, ampm = int(m.group(1)), int(m.group(2)), m.group(3)
+        else:
+            hour, minute, ampm = int(m.group(4)), 0, m.group(5)
+        if hour > 23 or minute > 59:
+            return None
+        if ampm == "pm" and hour < 12:
+            hour += 12
+        elif ampm == "am" and hour == 12:
+            hour = 0
+
+    wake = midnight + timedelta(days=1 if tomorrow else 0, hours=hour, minutes=minute)
+    if not tomorrow and wake <= now:
+        wake += timedelta(days=1)
+    return wake
+
+
+def format_wake(dt, now=None):
+    """Format a wake time for display, e.g. '4:15 PM CDT' or 'tomorrow 9:00 AM CDT'."""
+    now = now or datetime.now()
+    tz = now.astimezone().tzname() or ""
+    clock = dt.strftime("%I:%M %p").lstrip("0")
+    if dt.date() == now.date():
+        day = ""
+    elif dt.date() == now.date() + timedelta(days=1):
+        day = "tomorrow "
+    else:
+        day = f"{dt.strftime('%a %b')} {dt.day}, "
+    return f"{day}{clock} {tz}".rstrip()
+
+
+def snoozed_until(item, now=None):
+    """Return the local datetime a task is snoozed until, or None if not snoozed.
+
+    Marvin stores a one-time snooze in itemSnoozeTime (epoch ms wake time) and a
+    daily "permanent" snooze in permaSnoozeTime ("HH:mm"). While snoozed, the app
+    hides the task everywhere except the master list.
+    """
+    now = now or datetime.now()
+    ts = item.get("itemSnoozeTime")
+    if ts and ts / 1000 > now.timestamp():
+        return datetime.fromtimestamp(ts / 1000)
+    perma = item.get("permaSnoozeTime")
+    if perma:
+        try:
+            hour, minute = map(int, perma.split(":"))
+            wake = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if wake > now:
+                return wake
+        except (ValueError, AttributeError):
+            pass
+    return None
+
+
+def cmd_snooze(args):
+    """Snooze a task: hide it from today's view until a wake time."""
+    text = " ".join(args.duration)
+    now = datetime.now()
+    wake = parse_snooze_until(text, now)
+    if not wake:
+        print(f"Error: Could not parse duration/time '{text}'")
+        print("Examples: 4h, 30m, 2h30m, 2d, '4 hours', 9am, 16:30, 'tomorrow 9am'")
+        sys.exit(1)
+    if wake <= now:
+        print(f"Error: Wake time {format_wake(wake, now)} is not in the future")
+        sys.exit(1)
+    if wake - now > timedelta(days=366):
+        print(f"Error: Wake time {format_wake(wake, now)} is more than a year out — probably a typo")
+        sys.exit(1)
+
+    today_items = api_request("GET", "todayItems", full_access=True) or []
+    due_items = api_request("GET", "dueItems", full_access=True) or []
+    item = find_task_by_ref(args.task_id, gather_items(today_items, due_items))
+    title = item.get("title", "Untitled")
+
+    now_ms = int(now.timestamp() * 1000)
+    data = {
+        "itemId": item["_id"],
+        "setters": [
+            {"key": "itemSnoozeTime", "val": int(wake.timestamp() * 1000)},
+            {"key": "fieldUpdates.itemSnoozeTime", "val": now_ms},
+            {"key": "updatedAt", "val": now_ms},
+        ],
+    }
+    api_request("POST", "doc/update", data, full_access=True)
+    print(f"✓ Snoozed '{title[:50]}' until {format_wake(wake, now)}")
+
+
+def cmd_unsnooze(args):
+    """Clear a task's snooze so it shows in today's view again."""
+    today_items = api_request("GET", "todayItems", full_access=True) or []
+    due_items = api_request("GET", "dueItems", full_access=True) or []
+    item = find_task_by_ref(args.task_id, gather_items(today_items, due_items))
+    title = item.get("title", "Untitled")
+
+    if not item.get("itemSnoozeTime"):
+        print(f"'{title[:50]}' isn't snoozed.")
+        return
+
+    now_ms = int(datetime.now().timestamp() * 1000)
+    data = {
+        "itemId": item["_id"],
+        "setters": [
+            {"key": "itemSnoozeTime", "val": None},
+            {"key": "fieldUpdates.itemSnoozeTime", "val": now_ms},
+            {"key": "updatedAt", "val": now_ms},
+        ],
+    }
+    api_request("POST", "doc/update", data, full_access=True)
+    print(f"✓ Unsnoozed '{title[:50]}'")
+
+
+def cmd_snoozed(args):
+    """List currently snoozed tasks with their wake times."""
+    today_items = api_request("GET", "todayItems", full_access=True) or []
+    due_items = api_request("GET", "dueItems", full_access=True) or []
+    items = gather_items(today_items, due_items)
+
+    now = datetime.now()
+    snoozed = [(i, snoozed_until(i, now)) for i in items if not i.get("done")]
+    snoozed = [(i, w) for i, w in snoozed if w]
+    if not snoozed:
+        print("No snoozed tasks.")
+        return
+
+    snoozed.sort(key=lambda pair: pair[1])
+    print("Snoozed tasks:")
+    print("-" * 40)
+    for item, wake in snoozed:
+        _, title, time_str, sid = format_task(item)
+        print(f"  💤 {title}{time_str}  until {format_wake(wake, now)}  ({sid})")
+
+
 def cmd_search(args):
     """Search tasks by title (includes subtasks)."""
     query = " ".join(args.query).lower()
@@ -1195,6 +1410,10 @@ Examples:
   marvin completed               # Show completed tasks from last 7 days
   marvin completed --days 14     # Show completed tasks from last 14 days
   marvin reorder abc123 def456 ghi789
+  marvin snooze abc123 4h            # Hide from today until 4 hours from now
+  marvin snooze abc123 tomorrow 9am  # Hide until tomorrow morning
+  marvin unsnooze abc123             # Wake a snoozed task early
+  marvin snoozed                     # List snoozed tasks with wake times
   marvin skip-overdue                # Clear ALL overdue recurring instances
   marvin skip-overdue "Review PRs"   # Clear only that task's overdue instances
   marvin skip-overdue --dry-run      # Preview what would be cleared
@@ -1226,6 +1445,7 @@ Date formats for 'day' command:
     sub.add_argument("--projects", "-p", action="store_true", help="List projects/categories")
     sub.add_argument("--labels", "-l", action="store_true", help="List labels")
     sub.add_argument("--all", "-a", action="store_true", help="Include completed tasks (for --today)")
+    sub.add_argument("--snoozed", "-s", action="store_true", help="Show snoozed tasks (hidden by default, for --today)")
     sub.set_defaults(func=cmd_list)
 
     # add
@@ -1239,6 +1459,7 @@ Date formats for 'day' command:
     sub = subparsers.add_parser("today", help="List today's tasks")
     sub.add_argument("--date", "-d", help="Date (YYYY-MM-DD or natural language like 'yesterday')")
     sub.add_argument("--all", "-a", action="store_true", help="Include completed tasks")
+    sub.add_argument("--snoozed", "-s", action="store_true", help="Show snoozed tasks (hidden by default)")
     sub.set_defaults(func=cmd_today)
 
     # day - new command for viewing tasks by date
@@ -1246,6 +1467,7 @@ Date formats for 'day' command:
     sub.add_argument("date", nargs="*", help="Date (e.g., 'last friday', 'yesterday', '2024-01-15')")
     sub.add_argument("--incomplete", "-i", action="store_true", help="Show only incomplete tasks")
     sub.add_argument("--all", "-a", action="store_true", help="Include completed tasks")
+    sub.add_argument("--snoozed", "-s", action="store_true", help="Show snoozed tasks (hidden by default)")
     sub.set_defaults(func=cmd_day)
 
     # search - new command for searching tasks
@@ -1260,6 +1482,22 @@ Date formats for 'day' command:
     sub.add_argument("date", nargs="*", help="Target date (default: today)")
     sub.add_argument("--from", "-f", dest="from_date", nargs="+", help="Source date to search for task")
     sub.set_defaults(func=cmd_move)
+
+    # snooze - hide a task from today's view until a wake time
+    sub = subparsers.add_parser("snooze", help="Hide a task from today's view until a wake time")
+    sub.add_argument("task_id", help="Task ID (or prefix)")
+    sub.add_argument("duration", nargs="+",
+                     help="Duration (4h, 30m, 2h30m, '4 hours') or wake time (9am, 16:30, 'tomorrow 9am')")
+    sub.set_defaults(func=cmd_snooze)
+
+    # unsnooze - clear a snooze
+    sub = subparsers.add_parser("unsnooze", help="Clear a task's snooze so it shows again")
+    sub.add_argument("task_id", help="Task ID (or prefix)")
+    sub.set_defaults(func=cmd_unsnooze)
+
+    # snoozed - list snoozed tasks
+    sub = subparsers.add_parser("snoozed", help="List currently snoozed tasks with wake times")
+    sub.set_defaults(func=cmd_snoozed)
 
     # estimate - set time estimate for a task
     sub = subparsers.add_parser("estimate", help="Set time estimate for a task")
