@@ -15,7 +15,10 @@ Commands:
     marvin today                    # List today's tasks (with subtasks)
     marvin day last friday          # List tasks for a specific day
     marvin day yesterday -i         # Show incomplete tasks from yesterday
-    marvin subtasks <task_id>       # List subtasks of a task
+    marvin subtasks <task_id>       # List subtasks of a task (incl. unscheduled)
+    marvin note <task_id>           # Print a task's note
+    marvin note <task_id> "text"    # Set a task's note (--append to add to it)
+    marvin rm <task_id>             # Delete a task (asks for confirmation)
     marvin search <query>           # Search tasks and subtasks by title
     marvin done <task_id>           # Mark task or subtask complete
     marvin completed                # List completed tasks from last 7 days
@@ -30,6 +33,7 @@ Commands:
     marvin category Priority -a     # ...including completed
     marvin backlog                  # List open, unscheduled tasks (all categories)
     marvin backlog -u               # ...uncategorized root bucket only
+    marvin today -S                 # ...also fetch each task's child tasks
     marvin labels                   # List labels
     marvin setup                    # Configure API token
 """
@@ -266,26 +270,94 @@ def cmd_setup(args):
             print("✗ API token test failed")
 
 
-def find_task_by_ref(task_ref, items):
-    """Find a task by ID reference (full ID prefix or short ID prefix).
+def matchable_id(raw_id):
+    """The portion of an _id that a user-supplied task ref is matched against.
+
+    Recurring instances have a compound '<YYYY-MM-DD>_<uuid>' _id; every instance
+    of the same recurring task shares the uuid and differs only in the date, so
+    refs are matched against the uuid part (and against the full id as well).
+    """
+    if not raw_id:
+        return ""
+    return raw_id.split("_", 1)[-1] if "_" in raw_id else raw_id
+
+
+def ref_matches(item, task_ref):
+    """True if task_ref is a prefix of the item's full id or its matchable form."""
+    full_id = item.get("_id", "")
+    return full_id.startswith(task_ref) or matchable_id(full_id).startswith(task_ref)
+
+
+def ref_is_exact(item, task_ref):
+    """True if task_ref names the item's id outright rather than as a prefix."""
+    full_id = item.get("_id", "")
+    return task_ref in (full_id, matchable_id(full_id))
+
+
+def exit_ambiguous(task_ref, matches, action=None):
+    """Report an ambiguous task ref and exit rather than guessing which task.
+
+    Marvin ids created in the same session share a long common prefix, so a short
+    ref regularly matches several unrelated tasks (and a task's own children).
+    Silently picking one is how the wrong task gets completed or moved, so this
+    prints every candidate with an id long enough to tell them apart.
+    """
+    uids = unique_ids(matches)
+    print(f"Ambiguous task ref '{task_ref}' — matches {len(matches)} tasks:")
+    for m in matches:
+        full_id = m.get("_id", "")
+        # A shortest-unique prefix can't separate recurring instances (they share
+        # one uuid), so those fall back to the full compound id.
+        shown = uids.get(full_id, "")
+        if sum(1 for o in matches if matchable_id(o.get("_id", "")).startswith(shown)) > 1:
+            shown = full_id
+        title = m.get("title", "Untitled")
+        if len(title) > 60:
+            title = title[:57] + "..."
+        day = m.get("day", "")
+        meta = f"  sched:{day}" if day and day != "unassigned" else ""
+        due = m.get("dueDate", "")
+        meta += f"  due:{due}" if due else ""
+        print(f"  • {title}{meta}")
+        print(f"      {shown}")
+    verb = action or "Re-run"
+    print(f"\n{verb} with one of the ids above (a longer prefix is enough).")
+    sys.exit(1)
+
+
+def find_task_by_ref(task_ref, items, probe_children=True):
+    """Find a task by ID reference (full ID or a prefix of it).
+
+    An exact id wins over prefix matches. Otherwise a prefix that matches more
+    than one task is an error, never a guess. When a prefix matches exactly one
+    task, that task's own children are checked too: Marvin often gives a child an
+    id sharing ~30 characters with its parent, so the parent alone matching in
+    the caller's item pool does not mean the ref is unambiguous.
 
     Returns the matched item or exits with an error.
     """
-    def id_matches(item):
-        full_id = item.get("_id", "")
-        uuid_part = full_id.split("_", 1)[-1] if "_" in full_id else full_id
-        return full_id.startswith(task_ref) or uuid_part.startswith(task_ref)
+    exact = [i for i in items if ref_is_exact(i, task_ref)]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1:
+        exit_ambiguous(task_ref, exact)
 
-    matches = [i for i in items if id_matches(i)]
+    matches = [i for i in items if ref_matches(i, task_ref)]
+
+    if len(matches) == 1 and probe_children:
+        parent_id = matches[0].get("_id", "")
+        seen = {parent_id}
+        for child in fetch_children(parent_id):
+            cid = child.get("_id", "")
+            if cid not in seen and ref_matches(child, task_ref):
+                seen.add(cid)
+                matches.append(child)
 
     if not matches:
         print(f"No task found matching '{task_ref}'")
         sys.exit(1)
     if len(matches) > 1:
-        print(f"Multiple tasks match '{task_ref}':")
-        for idx, m in enumerate(matches, 1):
-            print(f"  {idx}. {m.get('title', 'Untitled')}")
-        sys.exit(1)
+        exit_ambiguous(task_ref, matches)
     return matches[0]
 
 
@@ -309,17 +381,107 @@ def short_id(raw_id):
 
     Handles recurring task IDs (e.g., '2026-03-31_abc12345') by splitting on
     the first underscore and using the part after it.
+
+    Prefer unique_ids()/display_ids() when showing a list: 8 characters is often
+    not unique in this account, so a bare short id can't safely be pasted back.
     """
-    if not raw_id:
-        return ""
-    return raw_id.split("_", 1)[-1][:8] if "_" in raw_id else raw_id[:8]
+    return matchable_id(raw_id)[:8]
 
 
-def format_task(item):
-    """Format a task for display. Returns (done_marker, title, time_str, short_id)."""
+def doc_get(doc_id):
+    """Fetch a single doc by exact id, or None if it doesn't exist.
+
+    The API answers a missing/deleted doc with HTTP 200 and an error payload
+    ({"error": "not_found"}), so a truthy response is not proof the doc exists.
+    """
+    doc = api_request("GET", "doc", {"id": doc_id}, full_access=True, tolerant=True)
+    if not isinstance(doc, dict) or doc.get("error") or not doc.get("_id"):
+        return None
+    return doc
+
+
+def fetch_children(parent_id):
+    """Child tasks of a task/category via the children endpoint.
+
+    This is the only way to see a child whose day is "unassigned" — such a task
+    appears in no day-based list (todayItems/dueItems/doneItems). Note the
+    endpoint omits *completed* children; there is no flag to include them.
+    """
+    if not parent_id:
+        return []
+    return api_request(
+        "GET", "children", {"parentId": parent_id}, full_access=True, tolerant=True
+    ) or []
+
+
+def day_task_pool(include_done=False, done_date=None):
+    """The day-based item pool: today's items, due items, optionally today's done."""
+    # todayItems with no date returns the server's notion of today, which a
+    # timezone rollover can put a day off from the local date — fetch both.
+    local_today = datetime.now().strftime("%Y-%m-%d")
+    sources = [
+        api_request("GET", "todayItems", full_access=True) or [],
+        api_request("GET", "todayItems", {"date": local_today}, full_access=True) or [],
+        api_request("GET", "dueItems", full_access=True) or [],
+    ]
+    if include_done:
+        date_str = done_date or datetime.now().strftime("%Y-%m-%d")
+        sources.append(
+            api_request("GET", "doneItems", {"date": date_str}, full_access=True) or []
+        )
+    return gather_items(*sources)
+
+
+def deep_task_pool():
+    """Every task filed directly under the root bucket or any category/project.
+
+    Reaches unscheduled tasks, which no day-based list returns. Costs one request
+    per category, so it is only used as a fallback when a ref matches nothing.
+    """
+    cats = api_request("GET", "categories", full_access=True) or []
+    sources = []
+    for pid in ["unassigned"] + [c["_id"] for c in cats]:
+        sources.append(fetch_children(pid))
+    return gather_items(*sources)
+
+
+def resolve_task(task_ref, extra_items=None, include_done=True, allow_deep=True):
+    """Resolve a task ref against progressively wider pools.
+
+    Starts with the day-based lists, widens to every category's children when the
+    ref matches nothing there (an unscheduled task lives only under its category),
+    and finally tries an exact doc lookup. Ambiguity is always an error.
+    """
+    items = gather_items(day_task_pool(include_done=include_done), extra_items or [])
+    if any(ref_matches(i, task_ref) for i in items):
+        return find_task_by_ref(task_ref, items)
+
+    if allow_deep:
+        items = gather_items(items, deep_task_pool())
+        if any(ref_matches(i, task_ref) for i in items):
+            return find_task_by_ref(task_ref, items)
+
+    doc = doc_get(task_ref)
+    if doc:
+        return doc
+
+    print(f"No task found matching '{task_ref}'")
+    print("Tried today/due/done lists, every category, and an exact id lookup.")
+    print("A task nested under another task resolves only by its FULL id —")
+    print("run 'marvin subtasks <parent>' to get it.")
+    sys.exit(1)
+
+
+def format_task(item, uids=None):
+    """Format a task for display. Returns (done_marker, title, time_str, id).
+
+    Pass the map from display_ids()/unique_ids() so the shown id is unique within
+    the list being printed and can therefore be pasted back into another command.
+    """
     done = "✓" if item.get("done") else "○"
     title = item.get("title", "Untitled")
-    sid = short_id(item.get("_id", ""))
+    raw_id = item.get("_id", "")
+    sid = (uids or {}).get(raw_id) or short_id(raw_id)
     time_est = item.get("timeEstimate")
     time_str = f" [{time_est // 60000}m]" if time_est else ""
     return done, title, time_str, sid
@@ -335,18 +497,45 @@ def unique_ids(items):
     keeps the shown id both readable and usable as a task ref. Genuine duplicate
     ids fall back to the full form.
     """
-    def matchable(i):
-        fid = i.get("_id", "")
-        return fid.split("_", 1)[-1] if "_" in fid else fid
-
-    forms = [matchable(i) for i in items]
+    forms = [matchable_id(i.get("_id", "")) for i in items]
     out = {}
     for item, form in zip(items, forms):
         n = 8
         while n < len(form) and sum(1 for f in forms if f.startswith(form[:n])) > 1:
             n += 1
+        # Instances of one recurring task share a single uuid, so no prefix
+        # length separates them. Lengthening only adds noise — keep it short and
+        # let the scheduled/due date shown alongside do the disambiguating.
+        if sum(1 for f in forms if f.startswith(form[:n])) > 1:
+            n = 8
         out[item.get("_id", "")] = form[:max(8, n)]
     return out
+
+
+def nested_child_ids(items):
+    """Map nested child tasks to their FULL id for display.
+
+    A task nested under another task appears in no day-based list and is not a
+    direct child of any category, so ref resolution can only find it through an
+    exact doc lookup — a shortened prefix would not resolve. Showing the full id
+    keeps these listings copy-pasteable into done/move/note/rm.
+    """
+    return {i.get("_id", ""): i.get("_id", "") for i in items}
+
+
+def display_ids(*groups):
+    """unique_ids() over several item lists plus every embedded subtask in them.
+
+    Embedded subtasks are shown alongside real tasks, so their ids have to be
+    disambiguated against the same pool — otherwise a displayed id could be
+    unique among tasks yet still collide with a subtask id in the same output.
+    """
+    pool = []
+    for group in groups:
+        for item in group or []:
+            pool.append(item)
+            pool.extend((item.get("subtasks") or {}).values())
+    return unique_ids(gather_items(pool))
 
 
 def cmd_add(args):
@@ -364,10 +553,9 @@ def cmd_add(args):
 
     parent_title = None
     if args.parent:
-        today_items = api_request("GET", "todayItems", full_access=True) or []
-        due_items = api_request("GET", "dueItems", full_access=True) or []
-        all_items = gather_items(today_items, due_items)
-        parent = find_task_by_ref(args.parent, all_items)
+        # resolve_task also reaches unscheduled tasks, so a subtask can be added
+        # under a backlog parent, not just one on today's list.
+        parent = resolve_task(args.parent)
         data["parentId"] = parent["_id"]
         parent_title = parent.get("title", "Untitled")
 
@@ -389,11 +577,31 @@ def cmd_add(args):
             print(f"  Scheduled: {day_str}")
 
 
+def collect_nested_children(items, exclude_ids=(), include_done=False):
+    """Fetch child tasks for each item: {parent _id: [children]}.
+
+    Costs one request per item, which is why every caller puts this behind an
+    opt-in flag. Children already present in the caller's list are excluded so
+    nothing is printed twice.
+    """
+    exclude = set(exclude_ids)
+    out = {}
+    for item in items:
+        parent_id = item.get("_id")
+        kids = [c for c in fetch_children(parent_id) if c.get("_id") not in exclude]
+        if not include_done:
+            kids = [c for c in kids if not c.get("done")]
+        if kids:
+            out[parent_id] = sorted(kids, key=lambda x: x.get("rank", 999999))
+    return out
+
+
 def cmd_today(args):
     """List today's tasks."""
     date_str = parse_date(args.date) if args.date else datetime.now().strftime("%Y-%m-%d")
     show_tasks_for_date(date_str, include_completed=args.all,
-                        show_snoozed=getattr(args, "snoozed", False))
+                        show_snoozed=getattr(args, "snoozed", False),
+                        show_children=getattr(args, "subtasks", False))
 
 
 def cmd_day(args):
@@ -401,11 +609,12 @@ def cmd_day(args):
     date_input = " ".join(args.date) if args.date else "today"
     date_str = parse_date(date_input)
     show_tasks_for_date(date_str, show_incomplete_only=args.incomplete, include_completed=args.all,
-                        show_snoozed=getattr(args, "snoozed", False))
+                        show_snoozed=getattr(args, "snoozed", False),
+                        show_children=getattr(args, "subtasks", False))
 
 
 def show_tasks_for_date(date_str, show_incomplete_only=False, include_completed=False,
-                        show_snoozed=False):
+                        show_snoozed=False, show_children=False):
     """Display tasks for a given date."""
     today_items = api_request("GET", "todayItems", {"date": date_str}, full_access=True) or []
 
@@ -458,6 +667,16 @@ def show_tasks_for_date(date_str, show_incomplete_only=False, include_completed=
 
     # Sort by rank (lower = higher priority)
     top_level = sorted(top_level, key=lambda x: x.get("rank", 999999))
+
+    # Unscheduled children live in no day-based list, so they can only be reached
+    # through the children endpoint — one request per top-level task, hence opt-in.
+    if show_children:
+        fetched = collect_nested_children(
+            top_level, exclude_ids=items_by_id.keys(), include_done=include_completed
+        )
+        for parent_id, kids in fetched.items():
+            children_by_parent[parent_id] = children_by_parent.get(parent_id, []) + kids
+
     for parent_id in children_by_parent:
         children_by_parent[parent_id] = sorted(
             children_by_parent[parent_id], key=lambda x: x.get("rank", 999999)
@@ -467,18 +686,22 @@ def show_tasks_for_date(date_str, show_incomplete_only=False, include_completed=
         wake = snoozed_wakes.get(item.get("_id"))
         return f" 💤 until {format_wake(wake, now)}" if wake else ""
 
+    uids = display_ids(items, [c for kids in children_by_parent.values() for c in kids])
+    if show_children:
+        uids.update(nested_child_ids([c for kids in fetched.values() for c in kids]))
+
     print(f"Tasks for {date_str}:")
     print("-" * 40)
 
     for idx, item in enumerate(top_level, 1):
-        done, title, time_str, sid = format_task(item)
+        done, title, time_str, sid = format_task(item, uids)
         print(f"  {idx}. {done} {title}{time_str}{snooze_note(item)}  ({sid})")
 
         # Print child items (separate tasks with parentId)
         item_id = item.get("_id")
         if item_id in children_by_parent:
             for subtask in children_by_parent[item_id]:
-                done, title, time_str, sid = format_task(subtask)
+                done, title, time_str, sid = format_task(subtask, uids)
                 print(f"      {done} {title}{time_str}{snooze_note(subtask)}  ({sid})")
 
         # Print embedded subtasks
@@ -492,7 +715,8 @@ def show_tasks_for_date(date_str, show_incomplete_only=False, include_completed=
             for subtask in sorted_subtasks:
                 sub_done = "✓" if subtask.get("done") else "○"
                 sub_title = subtask.get("title", "Untitled")
-                sub_sid = short_id(subtask.get("_id", ""))
+                raw = subtask.get("_id", "")
+                sub_sid = uids.get(raw) or short_id(raw)
                 print(f"      {sub_done} {sub_title}  ({sub_sid})")
 
     if hidden_count:
@@ -544,13 +768,19 @@ def cmd_done(args):
         print(f"✓ Marked done: {title}")
         return
 
-    # Try matching as a regular task (including child tasks)
-    def id_matches(item):
-        full_id = item.get("_id", "")
-        uuid_part = full_id.split("_", 1)[-1] if "_" in full_id else full_id
-        return full_id.startswith(task_ref) or uuid_part.startswith(task_ref)
+    # Try matching as a regular task (including child tasks). An exact id wins
+    # outright; otherwise a prefix is only usable if it names exactly one task.
+    exact = [i for i in items if ref_is_exact(i, task_ref)]
+    matches = exact if exact else [i for i in items if ref_matches(i, task_ref)]
 
-    matches = [i for i in items if id_matches(i)]
+    # Marvin frequently gives a child an id sharing ~30 chars with its parent, so
+    # a lone match in the day lists is not proof the ref is unambiguous.
+    if len(matches) == 1 and not exact:
+        seen = {matches[0].get("_id")}
+        for child in fetch_children(matches[0].get("_id", "")):
+            if child.get("_id") not in seen and ref_matches(child, task_ref):
+                seen.add(child.get("_id"))
+                matches.append(child)
 
     if len(matches) == 1:
         item = matches[0]
@@ -561,12 +791,9 @@ def cmd_done(args):
 
     if len(matches) > 1:
         # If all matches are recurring instances of the same task (same title,
-        # same base ID), complete the earliest one by due/scheduled date
+        # same recurring uuid), complete the earliest one by due/scheduled date
         titles = set(m.get("title", "") for m in matches)
-        base_ids = set(
-            (m.get("_id", "").split("_", 1)[-1][:8] if "_" in m.get("_id", "") else m.get("_id", "")[:8])
-            for m in matches
-        )
+        base_ids = set(matchable_id(m.get("_id", "")) for m in matches)
         if len(titles) == 1 and len(base_ids) == 1:
             # All recurring instances — pick the earliest by dueDate or day
             def sort_key(m):
@@ -580,15 +807,19 @@ def cmd_done(args):
             print(f"✓ Marked done: {item.get('title', 'Untitled')}{date_suffix}")
             return
 
-        print(f"Multiple tasks match '{task_ref}':")
-        for idx, m in enumerate(matches, 1):
-            date_label = m.get("dueDate") or m.get("day") or ""
-            date_suffix = f" (due: {date_label})" if date_label else ""
-            print(f"  {idx}. {m.get('title', 'Untitled')}{date_suffix}")
-        sys.exit(1)
+        exit_ambiguous(task_ref, matches, action="marvin done")
 
-    # No regular task matched — check embedded subtasks
+    # No regular task matched — check embedded subtasks, then widen the search to
+    # unscheduled tasks (which appear in no day-based list) before giving up.
     parent, sub_key, subtask = find_embedded_subtask(task_ref, items)
+    if not parent:
+        # Widen to unscheduled tasks and finally an exact doc lookup, which is
+        # the only way to reach a task nested under another task.
+        item = resolve_task(task_ref, extra_items=items)
+        api_request("POST", "markDone",
+                    {"itemId": item["_id"], "timeZoneOffset": get_tz_offset()})
+        print(f"✓ Marked done: {item.get('title', 'Untitled')}")
+        return
     if parent:
         now = int(datetime.now().timestamp() * 1000)
         data = {
@@ -641,6 +872,8 @@ def cmd_completed(args):
     print(f"Completed tasks (last {days} days):")
     print("=" * 50)
 
+    uids = display_ids(all_completed)
+
     total = 0
     for date in sorted(by_date.keys(), reverse=True):
         items = by_date[date]
@@ -662,7 +895,7 @@ def cmd_completed(args):
         print("-" * 40)
 
         for item in items:
-            _, title, time_str, sid = format_task(item)
+            _, title, time_str, sid = format_task(item, uids)
             print(f"  ✓ {title}{time_str}  ({sid})")
             # Show completed embedded subtasks
             for sub in sorted(
@@ -671,61 +904,188 @@ def cmd_completed(args):
             ):
                 if sub.get("done"):
                     sub_title = sub.get("title", "Untitled")
-                    sub_sid = short_id(sub.get("_id", ""))
+                    sub_sid = uids.get(sub.get("_id", "")) or short_id(sub.get("_id", ""))
                     print(f"      ✓ {sub_title}  ({sub_sid})")
                     total += 1
 
     print(f"\n{total} tasks completed in {days} days")
 
 
+DONE_CHILD_SCAN_DAYS = 14
+DONE_CHILD_LOOKAHEAD_DAYS = 2
+
+
 def cmd_subtasks(args):
-    """List subtasks of a specific task."""
+    """List subtasks of a specific task.
+
+    Marvin has two distinct things called subtasks and both are shown:
+      * child tasks   — separate task docs whose parentId points at this task
+      * embedded subtasks — lightweight entries inside the parent's `subtasks` field
+
+    Child tasks are read from the children endpoint rather than inferred from the
+    day-based lists. A freshly added child has day "unassigned", so it appears in
+    none of todayItems/dueItems/doneItems and was previously invisible here.
+    """
     task_ref = args.task_id
 
-    today_items = api_request("GET", "todayItems", full_access=True) or []
-    due_items = api_request("GET", "dueItems", full_access=True) or []
-    sources = [today_items, due_items]
-
-    if args.all:
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        done_items = api_request("GET", "doneItems", {"date": date_str}, full_access=True) or []
-        sources.append(done_items)
-
-    all_items = gather_items(*sources)
-
-    parent = find_task_by_ref(task_ref, all_items)
+    parent = resolve_task(task_ref)
     parent_title = parent.get("title", "Untitled")
-
-    # Collect child tasks (separate tasks with parentId pointing here)
     parent_id = parent.get("_id")
-    children = [i for i in all_items if i.get("parentId") == parent_id]
+
+    children = fetch_children(parent_id)
+
+    # The children endpoint omits completed children, so -a backfills them from
+    # the done lists. Anything completed longer ago than the scan window stays
+    # out of reach; say so rather than implying the list is complete.
+    done_scan_limited = False
+    if args.all:
+        done_sources = []
+        today = datetime.now().date()
+        # Completing an unscheduled task stamps its `day` with the completion
+        # date, which timezone offsets can push a day ahead of local today — so
+        # the window reaches forward as well as back.
+        for i in range(-DONE_CHILD_LOOKAHEAD_DAYS, DONE_CHILD_SCAN_DAYS):
+            date_str = (today - timedelta(days=i)).strftime("%Y-%m-%d")
+            done_sources.append(
+                api_request("GET", "doneItems", {"date": date_str},
+                            full_access=True, tolerant=True) or []
+            )
+        done_children = [
+            it for it in gather_items(*done_sources)
+            if it.get("parentId") == parent_id
+        ]
+        children = gather_items(children, done_children)
+        done_scan_limited = True
+    else:
+        children = [c for c in children if not c.get("done")]
+
     children = sorted(children, key=lambda x: x.get("rank", 999999))
 
-    # Collect embedded subtasks
-    embedded = parent.get("subtasks", {})
-    sorted_embedded = sorted(
-        embedded.values(), key=lambda x: x.get("rank", 999999)
-    )
+    embedded = list((parent.get("subtasks") or {}).values())
+    hidden_embedded = 0
+    if not args.all:
+        open_embedded = [s for s in embedded if not s.get("done")]
+        hidden_embedded = len(embedded) - len(open_embedded)
+        embedded = open_embedded
+    embedded = sorted(embedded, key=lambda x: x.get("rank", 999999))
 
-    if not children and not sorted_embedded:
-        print(f"No subtasks for: {parent_title}")
+    if not children and not embedded:
+        if hidden_embedded:
+            print(f"No open subtasks for: {parent_title}")
+            print(f"  ({hidden_embedded} completed — use --all to show)")
+        else:
+            print(f"No subtasks for: {parent_title}")
         return
 
     print(f"Subtasks of: {parent_title}")
     print("-" * 40)
 
+    uids = display_ids(children, [parent])
+    uids.update(nested_child_ids(children))
     for child in children:
-        done, title, time_str, sid = format_task(child)
-        print(f"  {done} {title}{time_str}  ({sid})")
+        done, title, time_str, sid = format_task(child, uids)
+        day = child.get("day", "")
+        meta = f"  sched:{day}" if day and day != "unassigned" else ""
+        due = child.get("dueDate", "")
+        meta += f"  due:{due}" if due else ""
+        print(f"  {done} {title}{time_str}{meta}  ({sid})")
 
-    for sub in sorted_embedded:
+    for sub in embedded:
         sub_done = "✓" if sub.get("done") else "○"
         sub_title = sub.get("title", "Untitled")
-        sub_sid = short_id(sub.get("_id", ""))
+        sub_sid = uids.get(sub.get("_id", "")) or short_id(sub.get("_id", ""))
         print(f"  {sub_done} {sub_title}  ({sub_sid})")
 
-    total = len(children) + len(sorted_embedded)
+    total = len(children) + len(embedded)
     print(f"\n{total} subtask(s)")
+    if hidden_embedded:
+        print(f"  ({hidden_embedded} completed hidden — use --all to show)")
+    if done_scan_limited:
+        print(f"  (completed children found by scanning {DONE_CHILD_SCAN_DAYS} days "
+              f"either side of today; older completions aren't listed)")
+
+
+def cmd_note(args):
+    """Read or write a task's note field."""
+    text = " ".join(args.text) if args.text else None
+    item = resolve_task(args.task_id)
+    title = item.get("title", "Untitled")
+
+    # The resolved item may come from a list endpoint that omits `note`; read the
+    # doc so appending never truncates an existing note.
+    doc = doc_get(item["_id"]) or item
+    current = doc.get("note") or ""
+
+    if text is None:
+        if not current:
+            print(f"No note on: {title}")
+            return
+        print(f"Note on: {title}")
+        print("-" * 40)
+        print(current)
+        return
+
+    if args.append and current:
+        new_note = current.rstrip("\n") + "\n" + text
+    else:
+        new_note = text
+
+    now = int(datetime.now().timestamp() * 1000)
+    api_request("POST", "doc/update", {
+        "itemId": item["_id"],
+        "setters": [
+            {"key": "note", "val": new_note},
+            {"key": "fieldUpdates.note", "val": now},
+            {"key": "updatedAt", "val": now},
+        ],
+    }, full_access=True)
+    verb = "Appended to" if (args.append and current) else "Set"
+    print(f"✓ {verb} note on '{title[:50]}'")
+
+
+def cmd_rm(args):
+    """Delete a task permanently, after confirmation."""
+    item = resolve_task(args.task_id)
+    title = item.get("title", "Untitled")
+
+    # doc/delete needs the current _rev as itemVersion; list endpoints carry it,
+    # but re-read to be sure it is current.
+    doc = doc_get(item["_id"])
+    if not doc:
+        print(f"Task no longer exists: {title}")
+        sys.exit(1)
+
+    children = fetch_children(doc["_id"])
+    print(f"Delete: {title}")
+    day = doc.get("day", "")
+    if day and day != "unassigned":
+        print(f"  scheduled: {day}")
+    if children:
+        print(f"  ⚠ has {len(children)} open child task(s) — they are NOT deleted "
+              f"and will be left orphaned:")
+        for c in children[:5]:
+            print(f"      - {c.get('title', 'Untitled')[:60]}")
+        if len(children) > 5:
+            print(f"      … and {len(children) - 5} more")
+
+    if not args.force:
+        if not sys.stdin.isatty():
+            print("\nRefusing to delete without confirmation. Re-run with --force.")
+            sys.exit(1)
+        answer = input("\nThis cannot be undone. Type 'yes' to delete: ").strip().lower()
+        if answer != "yes":
+            print("Aborted — nothing deleted.")
+            return
+
+    api_request("POST", "doc/delete", {
+        "itemId": doc["_id"],
+        "itemVersion": doc.get("_rev"),
+    }, full_access=True)
+
+    if doc_get(doc["_id"]):
+        print(f"✗ Delete did not take effect for '{title[:50]}'")
+        sys.exit(1)
+    print(f"✓ Deleted: {title[:60]}")
 
 
 def cmd_projects(args):
@@ -805,19 +1165,32 @@ def cmd_category(args):
     # Unscheduled first, then by scheduled day ascending.
     tasks.sort(key=lambda it: (it.get("day", "") not in ("", "unassigned"), it.get("day", "")))
 
+    # Tasks filed in a category can themselves have child tasks, which the
+    # category listing never returns. -S walks one level down into each.
+    nested = collect_nested_children(
+        tasks, exclude_ids=[i.get("_id") for i in items], include_done=args.all
+    ) if args.subtasks else {}
+
     title = cat.get("title", "Untitled")
     print(f"# {title}  ({len(tasks)} {'task' if len(tasks) == 1 else 'tasks'})")
     print("-" * 40)
     if not tasks:
         print("  (no tasks)")
-    uids = unique_ids(tasks)
-    for it in tasks:
-        done, ttl, time_str, _ = format_task(it)
+    uids = display_ids(tasks, [c for kids in nested.values() for c in kids])
+    uids.update(nested_child_ids([c for kids in nested.values() for c in kids]))
+
+    def meta_for(it):
         day = it.get("day", "")
         due = it.get("dueDate", "")
         meta = f"  sched:{day}" if day and day != "unassigned" else ""
-        meta += f"  due:{due}" if due else ""
-        print(f"  {done} {ttl}{time_str}{meta}  ({uids[it.get('_id', '')]})")
+        return meta + (f"  due:{due}" if due else "")
+
+    for it in tasks:
+        done, ttl, time_str, sid = format_task(it, uids)
+        print(f"  {done} {ttl}{time_str}{meta_for(it)}  ({sid})")
+        for kid in nested.get(it.get("_id"), []):
+            kdone, kttl, ktime, ksid = format_task(kid, uids)
+            print(f"      {kdone} {kttl}{ktime}{meta_for(kid)}  ({ksid})")
     if len(items) >= 200:
         print("  … (200-item API cap hit — list may be truncated)")
 
@@ -852,16 +1225,28 @@ def cmd_backlog(args):
         print("No unscheduled tasks. Backlog is clear.")
         return
 
+    all_listed = [it for _, tasks in groups for it in tasks]
+    # -S walks one level down into each listed task. Note this only reaches
+    # subtasks of tasks that are themselves unscheduled — an unscheduled subtask
+    # of a *scheduled* parent is found with 'marvin subtasks <parent>'.
+    nested = collect_nested_children(all_listed) if args.subtasks else {}
+
     # Unique ids computed across the whole backlog so a copied id is unambiguous.
-    uids = unique_ids([it for _, tasks in groups for it in tasks])
+    uids = display_ids(all_listed, [c for kids in nested.values() for c in kids])
+    uids.update(nested_child_ids([c for kids in nested.values() for c in kids]))
     print(f"Unscheduled backlog — {total} open task(s):")
     for label, tasks in groups:
         print(f"\n# {label}  ({len(tasks)})")
         for it in tasks:
-            done, ttl, time_str, _ = format_task(it)
+            done, ttl, time_str, sid = format_task(it, uids)
             due = it.get("dueDate", "")
             due_s = f"  due:{due}" if due else ""
-            print(f"  {done} {ttl}{time_str}{due_s}  ({uids[it.get('_id', '')]})")
+            print(f"  {done} {ttl}{time_str}{due_s}  ({sid})")
+            for kid in nested.get(it.get("_id"), []):
+                kdone, kttl, ktime, ksid = format_task(kid, uids)
+                kdue = kid.get("dueDate", "")
+                print(f"      {kdone} {kttl}{ktime}"
+                      f"{f'  due:{kdue}' if kdue else ''}  ({ksid})")
     if truncated:
         print(f"\n  ⚠ 200-item API cap hit for: {', '.join(truncated)} — some tasks may be hidden.")
 
@@ -877,8 +1262,9 @@ def cmd_due(args):
     print("Due tasks:")
     print("-" * 40)
 
+    uids = display_ids(items)
     for item in items:
-        _, title, time_str, sid = format_task(item)
+        _, title, time_str, sid = format_task(item, uids)
         due = item.get("dueDate", "no date")
         print(f"  ! {title}{time_str}  (due: {due}) ({sid})")
 
@@ -888,11 +1274,7 @@ def cmd_estimate(args):
     task_ref = args.task_id
     minutes = args.minutes
 
-    today_items = api_request("GET", "todayItems", full_access=True) or []
-    due_items = api_request("GET", "dueItems", full_access=True) or []
-    all_items = gather_items(today_items, due_items)
-
-    item = find_task_by_ref(task_ref, all_items)
+    item = resolve_task(task_ref)
     task_id = item["_id"]
     title = item.get("title", "Untitled")
 
@@ -933,8 +1315,7 @@ def cmd_move(args):
         if future_items:
             sources.append(future_items)
 
-    all_items = gather_items(*sources)
-    item = find_task_by_ref(task_ref, all_items)
+    item = resolve_task(task_ref, extra_items=gather_items(*sources))
     task_id = item["_id"]
     title = item.get("title", "Untitled")
 
@@ -1073,9 +1454,7 @@ def cmd_snooze(args):
         print(f"Error: Wake time {format_wake(wake, now)} is more than a year out — probably a typo")
         sys.exit(1)
 
-    today_items = api_request("GET", "todayItems", full_access=True) or []
-    due_items = api_request("GET", "dueItems", full_access=True) or []
-    item = find_task_by_ref(args.task_id, gather_items(today_items, due_items))
+    item = resolve_task(args.task_id)
     title = item.get("title", "Untitled")
 
     now_ms = int(now.timestamp() * 1000)
@@ -1093,9 +1472,7 @@ def cmd_snooze(args):
 
 def cmd_unsnooze(args):
     """Clear a task's snooze so it shows in today's view again."""
-    today_items = api_request("GET", "todayItems", full_access=True) or []
-    due_items = api_request("GET", "dueItems", full_access=True) or []
-    item = find_task_by_ref(args.task_id, gather_items(today_items, due_items))
+    item = resolve_task(args.task_id)
     title = item.get("title", "Untitled")
 
     if not item.get("itemSnoozeTime"):
@@ -1131,8 +1508,9 @@ def cmd_snoozed(args):
     snoozed.sort(key=lambda pair: pair[1])
     print("Snoozed tasks:")
     print("-" * 40)
+    uids = display_ids([i for i, _ in snoozed])
     for item, wake in snoozed:
-        _, title, time_str, sid = format_task(item)
+        _, title, time_str, sid = format_task(item, uids)
         print(f"  💤 {title}{time_str}  until {format_wake(wake, now)}  ({sid})")
 
 
@@ -1181,8 +1559,9 @@ def cmd_search(args):
     print(f"Tasks matching '{query}':")
     print("-" * 40)
 
+    uids = display_ids(matches, [sub for _, sub in subtask_matches])
     for item in matches:
-        done, title, time_str, sid = format_task(item)
+        done, title, time_str, sid = format_task(item, uids)
         scheduled = item.get("day", "")
         due = item.get("dueDate", "")
         date_info = f" (scheduled: {scheduled})" if scheduled else ""
@@ -1192,7 +1571,7 @@ def cmd_search(args):
     for parent_title, sub in subtask_matches:
         sub_done = "✓" if sub.get("done") else "○"
         sub_title = sub.get("title", "Untitled")
-        sub_sid = short_id(sub.get("_id", ""))
+        sub_sid = uids.get(sub.get("_id", "")) or short_id(sub.get("_id", ""))
         print(f"      {sub_done} {sub_title}  ({sub_sid})  [in: {parent_title}]")
 
 
@@ -1404,7 +1783,12 @@ Examples:
   marvin day last friday
   marvin day yesterday --incomplete
   marvin day 2024-01-15
-  marvin subtasks abc123             # List subtasks of a task
+  marvin subtasks abc123             # List subtasks (incl. unscheduled children)
+  marvin note abc123                 # Print a task's note
+  marvin note abc123 "Ran into X"    # Set the note
+  marvin note abc123 "Also Y" -A     # Append a line to the note
+  marvin rm abc123                   # Delete a task (confirmation required)
+  marvin today -S                    # Show unscheduled child tasks inline
   marvin search meeting              # Searches tasks and subtasks
   marvin done abc123                 # Works for tasks and subtasks
   marvin completed               # Show completed tasks from last 7 days
@@ -1446,6 +1830,7 @@ Date formats for 'day' command:
     sub.add_argument("--labels", "-l", action="store_true", help="List labels")
     sub.add_argument("--all", "-a", action="store_true", help="Include completed tasks (for --today)")
     sub.add_argument("--snoozed", "-s", action="store_true", help="Show snoozed tasks (hidden by default, for --today)")
+    sub.add_argument("--subtasks", "-S", action="store_true", help="Fetch child tasks too (for --today)")
     sub.set_defaults(func=cmd_list)
 
     # add
@@ -1460,6 +1845,8 @@ Date formats for 'day' command:
     sub.add_argument("--date", "-d", help="Date (YYYY-MM-DD or natural language like 'yesterday')")
     sub.add_argument("--all", "-a", action="store_true", help="Include completed tasks")
     sub.add_argument("--snoozed", "-s", action="store_true", help="Show snoozed tasks (hidden by default)")
+    sub.add_argument("--subtasks", "-S", action="store_true",
+                     help="Fetch each task's child tasks, including unscheduled ones (1 request per task)")
     sub.set_defaults(func=cmd_today)
 
     # day - new command for viewing tasks by date
@@ -1468,6 +1855,8 @@ Date formats for 'day' command:
     sub.add_argument("--incomplete", "-i", action="store_true", help="Show only incomplete tasks")
     sub.add_argument("--all", "-a", action="store_true", help="Include completed tasks")
     sub.add_argument("--snoozed", "-s", action="store_true", help="Show snoozed tasks (hidden by default)")
+    sub.add_argument("--subtasks", "-S", action="store_true",
+                     help="Fetch each task's child tasks, including unscheduled ones (1 request per task)")
     sub.set_defaults(func=cmd_day)
 
     # search - new command for searching tasks
@@ -1516,6 +1905,20 @@ Date formats for 'day' command:
     sub.add_argument("--all", "-a", action="store_true", help="Include completed tasks in search")
     sub.set_defaults(func=cmd_subtasks)
 
+    # note
+    sub = subparsers.add_parser("note", help="Read or write a task's note")
+    sub.add_argument("task_id", help="Task ID (or prefix)")
+    sub.add_argument("text", nargs="*", help="Note text (omit to print the current note)")
+    sub.add_argument("--append", "-A", action="store_true",
+                     help="Append to the existing note instead of replacing it")
+    sub.set_defaults(func=cmd_note)
+
+    # rm
+    sub = subparsers.add_parser("rm", help="Delete a task permanently (asks for confirmation)")
+    sub.add_argument("task_id", help="Task ID (or prefix)")
+    sub.add_argument("--force", "-f", action="store_true", help="Skip the confirmation prompt")
+    sub.set_defaults(func=cmd_rm)
+
     # completed
     sub = subparsers.add_parser("completed", help="List completed tasks from last N days")
     sub.add_argument("--days", "-d", type=int, default=7, help="Number of days to check (default: 7)")
@@ -1537,6 +1940,8 @@ Date formats for 'day' command:
     sub = subparsers.add_parser("category", help="List tasks in a category/project")
     sub.add_argument("name", nargs="+", help="Category/project name or 8-char id")
     sub.add_argument("--all", "-a", action="store_true", help="Include completed tasks")
+    sub.add_argument("--subtasks", "-S", action="store_true",
+                     help="Also list each task's child tasks (1 request per task)")
     sub.set_defaults(func=cmd_category)
 
     # backlog
@@ -1546,6 +1951,10 @@ Date formats for 'day' command:
     sub.add_argument(
         "--uncategorized", "-u", action="store_true",
         help="Only the uncategorized root bucket (skip walking categories)",
+    )
+    sub.add_argument(
+        "--subtasks", "-S", action="store_true",
+        help="Also list child tasks of each backlog task (1 request per task)",
     )
     sub.set_defaults(func=cmd_backlog)
 
