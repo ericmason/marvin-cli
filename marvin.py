@@ -432,6 +432,25 @@ def day_task_pool(include_done=False, done_date=None):
     return gather_items(*sources)
 
 
+UPCOMING_DAYS = 14
+
+
+def upcoming_task_pool(days=UPCOMING_DAYS):
+    """Tasks scheduled on each of the next `days` days (tomorrow onward).
+
+    A task scheduled for a future day appears in no list for today and is not
+    returned as a child of its category, so it has to be fetched day by day.
+    """
+    today = datetime.now().date()
+    sources = []
+    for i in range(1, days + 1):
+        date_str = (today + timedelta(days=i)).strftime("%Y-%m-%d")
+        sources.append(
+            api_request("GET", "todayItems", {"date": date_str}, full_access=True) or []
+        )
+    return gather_items(*sources)
+
+
 def deep_task_pool():
     """Every task filed directly under the root bucket or any category/project.
 
@@ -457,6 +476,10 @@ def resolve_task(task_ref, extra_items=None, include_done=True, allow_deep=True)
         return find_task_by_ref(task_ref, items)
 
     if allow_deep:
+        items = gather_items(items, upcoming_task_pool())
+        if any(ref_matches(i, task_ref) for i in items):
+            return find_task_by_ref(task_ref, items)
+
         items = gather_items(items, deep_task_pool())
         if any(ref_matches(i, task_ref) for i in items):
             return find_task_by_ref(task_ref, items)
@@ -466,7 +489,7 @@ def resolve_task(task_ref, extra_items=None, include_done=True, allow_deep=True)
         return doc
 
     print(f"No task found matching '{task_ref}'")
-    print("Tried today/due/done lists, every category, and an exact id lookup.")
+    print(f"Tried today/due/done lists, the next {UPCOMING_DAYS} days, every category, and an exact id lookup.")
     print("A task nested under another task resolves only by its FULL id —")
     print("run 'marvin subtasks <parent>' to get it.")
     sys.exit(1)
@@ -568,7 +591,7 @@ def cmd_add(args):
             print(f"  Parent: {parent_title}")
         if args.day:
             print(f"  Scheduled: {day_str}")
-        print(f"  ID: {task_id[:8]}...")
+        print(f"  ID: {task_id}")
     else:
         print(f"✓ Added: {title}")
         if parent_title:
@@ -1523,16 +1546,9 @@ def cmd_search(args):
 
     today_items = api_request("GET", "todayItems", full_access=True) or []
     due_items = api_request("GET", "dueItems", full_access=True) or []
-    sources = [today_items, due_items]
+    sources = [today_items, due_items, upcoming_task_pool()]
 
-    # Search upcoming days (next 14 days) to find scheduled tasks
     today = datetime.now().date()
-    for i in range(1, 15):
-        future_date = (today + timedelta(days=i)).strftime("%Y-%m-%d")
-        future_items = api_request("GET", "todayItems", {"date": future_date}, full_access=True) or []
-        if future_items:
-            sources.append(future_items)
-
     if args.all:
         date_str = today.strftime("%Y-%m-%d")
         done_items = api_request("GET", "doneItems", {"date": date_str}, full_access=True) or []
