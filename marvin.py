@@ -334,13 +334,18 @@ def find_task_by_ref(task_ref, items, probe_children=True):
     id sharing ~30 characters with its parent, so the parent alone matching in
     the caller's item pool does not mean the ref is unambiguous.
 
+    Several instances of one recurring task share a uuid, so a ref to that uuid
+    matches all of them; that case picks the earliest open instance instead of
+    erroring.
+
     Returns the matched item or exits with an error.
     """
     exact = [i for i in items if ref_is_exact(i, task_ref)]
     if len(exact) == 1:
         return exact[0]
     if len(exact) > 1:
-        exit_ambiguous(task_ref, exact)
+        exit_ambiguous_unless_recurring(task_ref, exact)
+        return earliest_instance(exact)
 
     matches = [i for i in items if ref_matches(i, task_ref)]
 
@@ -357,8 +362,33 @@ def find_task_by_ref(task_ref, items, probe_children=True):
         print(f"No task found matching '{task_ref}'")
         sys.exit(1)
     if len(matches) > 1:
-        exit_ambiguous(task_ref, matches)
+        exit_ambiguous_unless_recurring(task_ref, matches)
+        return earliest_instance(matches)
     return matches[0]
+
+
+def is_recurring_instance(item):
+    """True if the item's _id has the '<YYYY-MM-DD>_<uuid>' recurring form."""
+    full_id = item.get("_id", "")
+    return "_" in full_id and full_id != matchable_id(full_id)
+
+
+def exit_ambiguous_unless_recurring(task_ref, matches):
+    """Exit as ambiguous unless every match is an instance of one recurring task."""
+    uuids = {matchable_id(i.get("_id", "")) for i in matches}
+    if len(uuids) == 1 and all(is_recurring_instance(i) for i in matches):
+        return
+    exit_ambiguous(task_ref, matches)
+
+
+def earliest_instance(matches):
+    """The earliest-dated open instance, or the earliest instance if all are done."""
+    return min(matches, key=lambda i: (bool(i.get("done")), i.get("_id", "")))
+
+
+def is_full_length_id(task_ref):
+    """True if the ref is long enough to be a whole Marvin id, not a prefix."""
+    return len(matchable_id(task_ref)) >= 32
 
 
 def gather_items(*sources):
@@ -432,6 +462,27 @@ def day_task_pool(include_done=False, done_date=None):
     return gather_items(*sources)
 
 
+UPCOMING_DAYS = 14
+
+
+def upcoming_task_pool(days=UPCOMING_DAYS):
+    """Tasks scheduled on each of the next `days` days (tomorrow onward).
+
+    A task scheduled for a future day appears in no list for today and is not
+    returned as a child of its category, so it has to be fetched day by day.
+    """
+    today = datetime.now().date()
+    sources = []
+    for i in range(1, days + 1):
+        date_str = (today + timedelta(days=i)).strftime("%Y-%m-%d")
+        sources.append(
+            api_request(
+                "GET", "todayItems", {"date": date_str}, full_access=True, tolerant=True
+            ) or []
+        )
+    return gather_items(*sources)
+
+
 def deep_task_pool():
     """Every task filed directly under the root bucket or any category/project.
 
@@ -456,17 +507,27 @@ def resolve_task(task_ref, extra_items=None, include_done=True, allow_deep=True)
     if any(ref_matches(i, task_ref) for i in items):
         return find_task_by_ref(task_ref, items)
 
+    # A whole id resolves with one lookup; skip the per-day and per-category sweeps.
+    if is_full_length_id(task_ref):
+        doc = doc_get(task_ref)
+        if doc:
+            return doc
+
     if allow_deep:
+        items = gather_items(items, upcoming_task_pool())
+        if any(ref_matches(i, task_ref) for i in items):
+            return find_task_by_ref(task_ref, items)
+
         items = gather_items(items, deep_task_pool())
         if any(ref_matches(i, task_ref) for i in items):
             return find_task_by_ref(task_ref, items)
 
-    doc = doc_get(task_ref)
+    doc = None if is_full_length_id(task_ref) else doc_get(task_ref)
     if doc:
         return doc
 
     print(f"No task found matching '{task_ref}'")
-    print("Tried today/due/done lists, every category, and an exact id lookup.")
+    print(f"Tried today/due/done lists, the next {UPCOMING_DAYS} days, every category, and an exact id lookup.")
     print("A task nested under another task resolves only by its FULL id —")
     print("run 'marvin subtasks <parent>' to get it.")
     sys.exit(1)
@@ -568,7 +629,7 @@ def cmd_add(args):
             print(f"  Parent: {parent_title}")
         if args.day:
             print(f"  Scheduled: {day_str}")
-        print(f"  ID: {task_id[:8]}...")
+        print(f"  ID: {task_id}")
     else:
         print(f"✓ Added: {title}")
         if parent_title:
@@ -1523,16 +1584,9 @@ def cmd_search(args):
 
     today_items = api_request("GET", "todayItems", full_access=True) or []
     due_items = api_request("GET", "dueItems", full_access=True) or []
-    sources = [today_items, due_items]
+    sources = [today_items, due_items, upcoming_task_pool()]
 
-    # Search upcoming days (next 14 days) to find scheduled tasks
     today = datetime.now().date()
-    for i in range(1, 15):
-        future_date = (today + timedelta(days=i)).strftime("%Y-%m-%d")
-        future_items = api_request("GET", "todayItems", {"date": future_date}, full_access=True) or []
-        if future_items:
-            sources.append(future_items)
-
     if args.all:
         date_str = today.strftime("%Y-%m-%d")
         done_items = api_request("GET", "doneItems", {"date": date_str}, full_access=True) or []
