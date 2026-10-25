@@ -27,7 +27,8 @@ def task(_id, title, day="unassigned", **extra):
 class FakeMarvin:
     """Routes api_request calls to fixed pools and records every POST."""
 
-    def __init__(self, today=(), upcoming=None, children=None, docs=None, categories=()):
+    def __init__(self, today=(), upcoming=None, children=None, docs=None, categories=(), fail=()):
+        self.fail = set(fail)                   # (endpoint, date or parentId) that error
         self.today = list(today)
         self.upcoming = upcoming or {}          # date -> [items]
         self.children = children or {}          # parentId -> [items]
@@ -42,6 +43,9 @@ class FakeMarvin:
                 self.docs.pop(data["itemId"], None)
             return None
         data = data or {}
+        if (endpoint, data.get("date") or data.get("parentId")) in self.fail:
+            assert tolerant, f"{endpoint} failure would have exited"
+            return None
         if endpoint == "todayItems":
             return list(self.upcoming.get(data.get("date"), [])) if "date" in data else list(self.today)
         if endpoint in ("dueItems", "doneItems"):
@@ -106,20 +110,30 @@ class RecurringIncident(unittest.TestCase):
         self.assertEqual(self.fake.posts, [])
         self.assertIn("names a recurring task", out)
 
+    MUTATING = [
+        (marvin.cmd_rm, dict(task_id="628bcfd6", force=True)),
+        (marvin.cmd_done, dict(task_id="628bcfd6")),
+        (marvin.cmd_move, dict(task_id="628bcfd6", date=["2026-10-30"], from_date=None)),
+        (marvin.cmd_snooze, dict(task_id="628bcfd6", duration=["2h"])),
+        (marvin.cmd_estimate, dict(task_id="628bcfd6", minutes=30)),
+    ]
+
     def test_every_mutating_command_refuses_the_ambiguous_ref(self):
-        cases = [
-            (marvin.cmd_rm, dict(task_id="628bcfd6", force=True)),
-            (marvin.cmd_done, dict(task_id="628bcfd6")),
-            (marvin.cmd_move, dict(task_id="628bcfd6", date=["2026-10-30"], from_date=None)),
-            (marvin.cmd_snooze, dict(task_id="628bcfd6", duration=["2h"])),
-            (marvin.cmd_estimate, dict(task_id="628bcfd6", minutes=30)),
-        ]
-        for func, kwargs in cases:
+        for func, kwargs in self.MUTATING:
             with self.subTest(func.__name__):
                 code, out = run(func, **kwargs)
                 self.assertEqual(code, 1, out)
                 self.assertEqual(self.fake.posts, [], out)
                 self.assertIn("Ambiguous", out)
+
+    def test_every_mutating_command_refuses_with_one_instance_in_view(self):
+        self.fake.children = {}
+        for func, kwargs in self.MUTATING:
+            with self.subTest(func.__name__):
+                code, out = run(func, **kwargs)
+                self.assertEqual(code, 1, out)
+                self.assertEqual(self.fake.posts, [], out)
+                self.assertIn("names a recurring task", out)
 
     def test_full_template_uuid_is_refused(self):
         code, out = run(marvin.cmd_rm, task_id=RECUR, force=True)
@@ -187,6 +201,51 @@ class PrefixAcrossPools(unittest.TestCase):
         self.assertIsInstance(setters["doneAt"], int)
         self.assertEqual(setters["fieldUpdates.done"], setters["doneAt"])
         self.assertIn("(project)", out)
+
+
+class ReviewFollowUps(unittest.TestCase):
+    """Reorder prefixes, failed fetches, subtasks outside today, full regular ids."""
+
+    def setUp(self):
+        self.a = task("abcdef12aaaaaaaaaaaaaaaaaaaaaaaa", "A", day="2026-10-25")
+        self.b = task("abcdef12bbbbbbbbbbbbbbbbbbbbbbbb", "B", day="2026-10-25")
+        self.fake = FakeMarvin(today=[self.a, self.b], docs={self.a["_id"]: self.a, self.b["_id"]: self.b})
+        patcher = mock.patch.object(marvin, "api_request", self.fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_reorder_refuses_a_shared_8_char_prefix(self):
+        code, out = run(marvin.cmd_reorder, task_ids=["abcdef12"])
+        self.assertEqual(code, 1, out)
+        self.assertEqual(self.fake.posts, [])
+        self.assertIn("Ambiguous", out)
+
+    def test_reorder_accepts_a_unique_prefix(self):
+        code, out = run(marvin.cmd_reorder, task_ids=["abcdef12b"])
+        self.assertIsNone(code, out)
+        self.assertEqual({d["itemId"] for _, d in self.fake.posts}, {self.b["_id"]})
+
+    def test_failed_sweep_fetch_refuses_instead_of_resolving(self):
+        self.fake.today = [self.a]
+        self.fake.fail = {("children", "unassigned")}
+        code, out = run(marvin.cmd_rm, task_id="abcdef12", force=True)
+        self.assertEqual(code, 1, out)
+        self.assertEqual(self.fake.posts, [])
+        self.assertIn("partial list", out)
+
+    def test_subtask_of_an_upcoming_task_makes_the_ref_ambiguous(self):
+        parent = task("ffff0000ffff0000ffff0000ffff0000", "Parent", day=IN_TWO_DAYS,
+                      subtasks={"abcdef12cc": {"_id": "abcdef12cc", "title": "Sub"}})
+        self.fake.today = [self.a]
+        self.fake.upcoming = {IN_TWO_DAYS: [parent]}
+        code, out = run(marvin.cmd_done, task_id="abcdef12")
+        self.assertEqual(code, 1, out)
+        self.assertEqual(self.fake.posts, [])
+
+    def test_full_length_regular_id_resolves_by_doc_lookup(self):
+        self.fake.today = []
+        with mock.patch.object(marvin, "upcoming_task_pool", side_effect=AssertionError("swept")):
+            self.assertIs(marvin.resolve_task(self.b["_id"]), self.b)
 
 
 class DisplayIds(unittest.TestCase):
