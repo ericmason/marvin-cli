@@ -68,7 +68,7 @@ marvin add "Review PR #Work @urgent"
 marvin add "Fix tests" -p abc123    # Add a subtask under parent abc123
 marvin add "Deploy" -d next monday  # Schedule for a date
 
-marvin done abc123                  # Complete a task or subtask
+marvin done abc123                  # Complete a task, project, or subtask
 marvin estimate abc123 30           # Set a 30-minute estimate
 marvin move abc123 tomorrow         # Reschedule to another day
 marvin snooze abc123 4h             # Hide from today until 4 hours from now
@@ -208,11 +208,9 @@ So a "short ID" is frequently ambiguous. The CLI handles that as follows:
   any category, so it can only be resolved by an exact ID lookup — a shortened
   prefix would not find it.
 
-Recurring task instances have a compound `YYYY-MM-DD_<uuid>` ID and the CLI
-matches on either part. Every instance of one recurring task shares the same
-uuid, so no prefix can separate them; listings show the short form and
-disambiguate with the scheduled/due date instead. `marvin done` on such a
-reference completes the earliest outstanding instance.
+- **A prefix is checked against every list before anything changes**: today, due, the next 14 days, and every category. A match in today's list can't hide a second match in the backlog. That sweep takes a few seconds; a full ID skips it.
+
+Recurring task instances have a compound `YYYY-MM-DD_<uuid>` ID, and every instance of one recurring task shares the same uuid. Listings show the full compound ID, because no shorter form names a single instance. A reference that reaches an instance through the uuid alone is refused and the instances found are listed, even when only one is in view. The bare uuid is the recurring task's template, and commands refuse it too.
 
 ## License
 

@@ -44,6 +44,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -288,22 +289,23 @@ def ref_matches(item, task_ref):
     return full_id.startswith(task_ref) or matchable_id(full_id).startswith(task_ref)
 
 
-def ref_is_exact(item, task_ref):
-    """True if task_ref names the item's id outright rather than as a prefix."""
-    full_id = item.get("_id", "")
-    return task_ref in (full_id, matchable_id(full_id))
-
-
-def exit_ambiguous(task_ref, matches, action=None):
+def exit_ambiguous(task_ref, matches, action=None, recurring=False):
     """Report an ambiguous task ref and exit rather than guessing which task.
 
     Marvin ids created in the same session share a long common prefix, so a short
     ref regularly matches several unrelated tasks (and a task's own children).
     Silently picking one is how the wrong task gets completed or moved, so this
     prints every candidate with an id long enough to tell them apart.
+
+    recurring=True means the ref names a recurring task's shared uuid, which
+    matches every instance of it, not only the ones listed.
     """
     uids = unique_ids(matches)
-    print(f"Ambiguous task ref '{task_ref}' — matches {len(matches)} tasks:")
+    if recurring:
+        print(f"Ambiguous task ref '{task_ref}' — it names a recurring task, and "
+              f"every instance of it shares that id. Instances found:")
+    else:
+        print(f"Ambiguous task ref '{task_ref}' — matches {len(matches)} tasks:")
     for m in matches:
         full_id = m.get("_id", "")
         # A shortest-unique prefix can't separate recurring instances (they share
@@ -321,33 +323,41 @@ def exit_ambiguous(task_ref, matches, action=None):
         print(f"  • {title}{meta}")
         print(f"      {shown}")
     verb = action or "Re-run"
-    print(f"\n{verb} with one of the ids above (a longer prefix is enough).")
+    if recurring:
+        print(f"\n{verb} with the dated id of the instance you mean "
+              f"(<YYYY-MM-DD>_<uuid>, as shown above).")
+    else:
+        print(f"\n{verb} with one of the ids above (a longer prefix is enough).")
     sys.exit(1)
 
 
 def find_task_by_ref(task_ref, items, probe_children=True):
     """Find a task by ID reference (full ID or a prefix of it).
 
-    An exact id wins over prefix matches. Otherwise a prefix that matches more
-    than one task is an error, never a guess. When a prefix matches exactly one
-    task, that task's own children are checked too: Marvin often gives a child an
-    id sharing ~30 characters with its parent, so the parent alone matching in
-    the caller's item pool does not mean the ref is unambiguous.
+    An item whose full id equals the ref wins outright. Otherwise a ref that
+    matches more than one item is an error, never a guess. When a prefix matches
+    exactly one task, that task's own children are checked too: Marvin often
+    gives a child an id sharing ~30 characters with its parent, so the parent
+    alone matching in the caller's item pool does not mean the ref is
+    unambiguous.
 
-    Several instances of one recurring task share a uuid, so a ref to that uuid
-    matches all of them; that case picks the earliest open instance instead of
-    erroring.
+    A ref that reaches a recurring instance only through its uuid part names
+    every instance of that recurring task, including ones outside `items`, so it
+    is refused even when only one instance is in view.
 
     Returns the matched item or exits with an error.
     """
-    exact = [i for i in items if ref_is_exact(i, task_ref)]
+    exact = [i for i in items if i.get("_id") == task_ref]
     if len(exact) == 1:
         return exact[0]
-    if len(exact) > 1:
-        exit_ambiguous_unless_recurring(task_ref, exact)
-        return earliest_instance(exact)
 
     matches = [i for i in items if ref_matches(i, task_ref)]
+
+    if not matches:
+        print(f"No task found matching '{task_ref}'")
+        sys.exit(1)
+    if any(matches_recurring_uuid_only(i, task_ref) for i in matches):
+        exit_ambiguous(task_ref, matches, recurring=True)
 
     if len(matches) == 1 and probe_children:
         parent_id = matches[0].get("_id", "")
@@ -358,12 +368,8 @@ def find_task_by_ref(task_ref, items, probe_children=True):
                 seen.add(cid)
                 matches.append(child)
 
-    if not matches:
-        print(f"No task found matching '{task_ref}'")
-        sys.exit(1)
     if len(matches) > 1:
-        exit_ambiguous_unless_recurring(task_ref, matches)
-        return earliest_instance(matches)
+        exit_ambiguous(task_ref, matches)
     return matches[0]
 
 
@@ -373,22 +379,34 @@ def is_recurring_instance(item):
     return "_" in full_id and full_id != matchable_id(full_id)
 
 
-def exit_ambiguous_unless_recurring(task_ref, matches):
-    """Exit as ambiguous unless every match is an instance of one recurring task."""
-    uuids = {matchable_id(i.get("_id", "")) for i in matches}
-    if len(uuids) == 1 and all(is_recurring_instance(i) for i in matches):
-        return
-    exit_ambiguous(task_ref, matches)
+def matches_recurring_uuid_only(item, task_ref):
+    """True if task_ref reaches a recurring instance only through its uuid part.
 
-
-def earliest_instance(matches):
-    """The earliest-dated open instance, or the earliest instance if all are done."""
-    return min(matches, key=lambda i: (bool(i.get("done")), i.get("_id", "")))
+    Every instance of a recurring task carries the same uuid, so such a ref is
+    ambiguous by nature: the instances a caller can see are not all there are.
+    """
+    return is_recurring_instance(item) and not item.get("_id", "").startswith(task_ref)
 
 
 def is_full_length_id(task_ref):
     """True if the ref is long enough to be a whole Marvin id, not a prefix."""
     return len(matchable_id(task_ref)) >= 32
+
+
+def refuse_recurring_template(doc):
+    """Exit if doc is a recurring task's template rather than a task.
+
+    A recurring instance's uuid part is its template's id, so a doc lookup on
+    that uuid returns the template; completing, moving, or deleting it would act
+    on the whole series instead of one occurrence.
+    """
+    if doc.get("db") == "RecurringTasks":
+        print(f"'{doc.get('_id', '')}' is the recurring task '{doc.get('title', 'Untitled')}', "
+              f"not one occurrence of it.")
+        print("Use the dated id of an instance (<YYYY-MM-DD>_<uuid>); "
+              "'marvin day <date>' lists them.")
+        sys.exit(1)
+    return doc
 
 
 def gather_items(*sources):
@@ -409,13 +427,15 @@ def gather_items(*sources):
 def short_id(raw_id):
     """Extract a consistent 8-character short ID from a raw task/subtask ID.
 
-    Handles recurring task IDs (e.g., '2026-03-31_abc12345') by splitting on
-    the first underscore and using the part after it.
+    A recurring instance ('2026-03-31_<uuid>') gets its full id: every instance
+    of the task shares the uuid, so no shortened form names just that instance.
 
     Prefer unique_ids()/display_ids() when showing a list: 8 characters is often
     not unique in this account, so a bare short id can't safely be pasted back.
     """
-    return matchable_id(raw_id)[:8]
+    if raw_id and raw_id != matchable_id(raw_id):
+        return raw_id
+    return raw_id[:8]
 
 
 def doc_get(doc_id):
@@ -463,6 +483,9 @@ def day_task_pool(include_done=False, done_date=None):
 
 
 UPCOMING_DAYS = 14
+# Concurrent requests when sweeping days or categories; api_request backs off
+# on 429, so this only needs to stay modest.
+POOL_WORKERS = 4
 
 
 def upcoming_task_pool(days=UPCOMING_DAYS):
@@ -472,15 +495,15 @@ def upcoming_task_pool(days=UPCOMING_DAYS):
     returned as a child of its category, so it has to be fetched day by day.
     """
     today = datetime.now().date()
-    sources = []
-    for i in range(1, days + 1):
-        date_str = (today + timedelta(days=i)).strftime("%Y-%m-%d")
-        sources.append(
-            api_request(
-                "GET", "todayItems", {"date": date_str}, full_access=True, tolerant=True
-            ) or []
-        )
-    return gather_items(*sources)
+    dates = [(today + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, days + 1)]
+
+    def fetch_day(date_str):
+        return api_request(
+            "GET", "todayItems", {"date": date_str}, full_access=True, tolerant=True
+        ) or []
+
+    with ThreadPoolExecutor(max_workers=POOL_WORKERS) as pool:
+        return gather_items(*pool.map(fetch_day, dates))
 
 
 def deep_task_pool():
@@ -490,41 +513,35 @@ def deep_task_pool():
     per category, so it is only used as a fallback when a ref matches nothing.
     """
     cats = api_request("GET", "categories", full_access=True) or []
-    sources = []
-    for pid in ["unassigned"] + [c["_id"] for c in cats]:
-        sources.append(fetch_children(pid))
-    return gather_items(*sources)
+    parent_ids = ["unassigned"] + [c["_id"] for c in cats]
+    with ThreadPoolExecutor(max_workers=POOL_WORKERS) as pool:
+        return gather_items(*pool.map(fetch_children, parent_ids))
 
 
 def resolve_task(task_ref, extra_items=None, include_done=True, allow_deep=True):
-    """Resolve a task ref against progressively wider pools.
+    """Resolve a task ref to exactly one item, or exit.
 
-    Starts with the day-based lists, widens to every category's children when the
-    ref matches nothing there (an unscheduled task lives only under its category),
-    and finally tries an exact doc lookup. Ambiguity is always an error.
+    A whole id resolves with one exact doc lookup. A prefix is matched against
+    every pool at once — the day-based lists, the next UPCOMING_DAYS days, and
+    every category's children — because a match in a narrow pool says nothing
+    about matches in a wider one: stopping at the first hit is how a prefix
+    meant for an unscheduled task deleted a scheduled one. Ambiguity is always
+    an error.
     """
-    items = gather_items(day_task_pool(include_done=include_done), extra_items or [])
-    if any(ref_matches(i, task_ref) for i in items):
-        return find_task_by_ref(task_ref, items)
-
-    # A whole id resolves with one lookup; skip the per-day and per-category sweeps.
     if is_full_length_id(task_ref):
         doc = doc_get(task_ref)
         if doc:
-            return doc
+            return refuse_recurring_template(doc)
 
+    items = gather_items(day_task_pool(include_done=include_done), extra_items or [])
     if allow_deep:
-        items = gather_items(items, upcoming_task_pool())
-        if any(ref_matches(i, task_ref) for i in items):
-            return find_task_by_ref(task_ref, items)
-
-        items = gather_items(items, deep_task_pool())
-        if any(ref_matches(i, task_ref) for i in items):
-            return find_task_by_ref(task_ref, items)
+        items = gather_items(items, upcoming_task_pool(), deep_task_pool())
+    if any(ref_matches(i, task_ref) for i in items):
+        return find_task_by_ref(task_ref, items)
 
     doc = None if is_full_length_id(task_ref) else doc_get(task_ref)
     if doc:
-        return doc
+        return refuse_recurring_template(doc)
 
     print(f"No task found matching '{task_ref}'")
     print(f"Tried today/due/done lists, the next {UPCOMING_DAYS} days, every category, and an exact id lookup.")
@@ -557,19 +574,22 @@ def unique_ids(items):
     at the end, so a fixed 8-char id collides. Displaying a context-unique prefix
     keeps the shown id both readable and usable as a task ref. Genuine duplicate
     ids fall back to the full form.
+
+    A recurring instance is always shown by its full '<YYYY-MM-DD>_<uuid>' id.
+    Its uuid is shared with every other instance of the task, in this list or
+    not, so any shortened form would name all of them.
     """
     forms = [matchable_id(i.get("_id", "")) for i in items]
     out = {}
     for item, form in zip(items, forms):
+        raw_id = item.get("_id", "")
+        if is_recurring_instance(item):
+            out[raw_id] = raw_id
+            continue
         n = 8
         while n < len(form) and sum(1 for f in forms if f.startswith(form[:n])) > 1:
             n += 1
-        # Instances of one recurring task share a single uuid, so no prefix
-        # length separates them. Lengthening only adds noise — keep it short and
-        # let the scheduled/due date shown alongside do the disambiguating.
-        if sum(1 for f in forms if f.startswith(form[:n])) > 1:
-            n = 8
-        out[item.get("_id", "")] = form[:max(8, n)]
+        out[raw_id] = form[:max(8, n)]
     return out
 
 
@@ -784,11 +804,12 @@ def show_tasks_for_date(date_str, show_incomplete_only=False, include_completed=
         print(f"\n  💤 {hidden_count} snoozed — 'marvin snoozed' to list, --snoozed to show")
 
 
-def find_embedded_subtask(task_ref, items):
-    """Search for an embedded subtask matching task_ref within items.
+def find_embedded_subtasks(task_ref, items):
+    """Every embedded subtask within items whose id or key starts with task_ref.
 
-    Returns (parent_item, subtask_key, subtask_dict) or (None, None, None).
+    Returns a list of (parent_item, subtask_key, subtask_dict).
     """
+    found = []
     for item in items:
         embedded = item.get("subtasks", {})
         if not embedded:
@@ -796,8 +817,35 @@ def find_embedded_subtask(task_ref, items):
         for key, sub in embedded.items():
             sub_id = sub.get("_id", "")
             if sub_id.startswith(task_ref) or key.startswith(task_ref):
-                return item, key, sub
-    return None, None, None
+                found.append((item, key, sub))
+    return found
+
+
+def mark_done(item):
+    """Mark a task or project done.
+
+    markDone only accepts tasks ("Can only mark Tasks done with this API"), so a
+    project is completed with a doc update instead, setting the same fields the
+    app sets.
+    """
+    if item.get("type") == "category":
+        print(f"'{item.get('title', 'Untitled')}' is a category; only tasks and projects can be done.")
+        sys.exit(1)
+    if item.get("type") == "project":
+        now = int(datetime.now().timestamp() * 1000)
+        api_request("POST", "doc/update", {
+            "itemId": item["_id"],
+            "setters": [
+                {"key": "done", "val": True},
+                {"key": "doneAt", "val": now},
+                {"key": "fieldUpdates.done", "val": now},
+                {"key": "updatedAt", "val": now},
+            ],
+        }, full_access=True)
+        print(f"✓ Marked done: {item.get('title', 'Untitled')} (project)")
+        return
+    api_request("POST", "markDone", {"itemId": item["_id"], "timeZoneOffset": get_tz_offset()})
+    print(f"✓ Marked done: {item.get('title', 'Untitled')}")
 
 
 def cmd_done(args):
@@ -811,76 +859,34 @@ def cmd_done(args):
     due_items = api_request("GET", "dueItems", full_access=True) or []
     items = gather_items(today_items, done_items, due_items)
 
-    if not items:
-        print("No tasks found for today.")
-        sys.exit(1)
-
     # Check if it's a number (list index for top-level tasks)
     if task_ref.isdigit():
+        if not items:
+            print("No tasks found for today.")
+            sys.exit(1)
         idx = int(task_ref)
         if idx < 1 or idx > len(items):
             print(f"Invalid task number. Use 1-{len(items)}.")
             sys.exit(1)
-        item = items[idx - 1]
-        task_id = item["_id"]
-        title = item.get("title", "Untitled")
-        data = {"itemId": task_id, "timeZoneOffset": get_tz_offset()}
-        api_request("POST", "markDone", data)
-        print(f"✓ Marked done: {title}")
+        mark_done(items[idx - 1])
         return
 
-    # Try matching as a regular task (including child tasks). An exact id wins
-    # outright; otherwise a prefix is only usable if it names exactly one task.
-    exact = [i for i in items if ref_is_exact(i, task_ref)]
-    matches = exact if exact else [i for i in items if ref_matches(i, task_ref)]
-
-    # Marvin frequently gives a child an id sharing ~30 chars with its parent, so
-    # a lone match in the day lists is not proof the ref is unambiguous.
-    if len(matches) == 1 and not exact:
-        seen = {matches[0].get("_id")}
-        for child in fetch_children(matches[0].get("_id", "")):
-            if child.get("_id") not in seen and ref_matches(child, task_ref):
-                seen.add(child.get("_id"))
-                matches.append(child)
-
-    if len(matches) == 1:
-        item = matches[0]
-        data = {"itemId": item["_id"], "timeZoneOffset": get_tz_offset()}
-        api_request("POST", "markDone", data)
-        print(f"✓ Marked done: {item.get('title', 'Untitled')}")
+    # Embedded subtasks live inside their parent's doc, so no task pool holds
+    # them. With none matching, the ref is a task (or project) ref and
+    # resolve_task refuses it if it is ambiguous.
+    subs = find_embedded_subtasks(task_ref, items)
+    if not subs:
+        mark_done(resolve_task(task_ref, extra_items=items))
         return
 
-    if len(matches) > 1:
-        # If all matches are recurring instances of the same task (same title,
-        # same recurring uuid), complete the earliest one by due/scheduled date
-        titles = set(m.get("title", "") for m in matches)
-        base_ids = set(matchable_id(m.get("_id", "")) for m in matches)
-        if len(titles) == 1 and len(base_ids) == 1:
-            # All recurring instances — pick the earliest by dueDate or day
-            def sort_key(m):
-                return m.get("dueDate") or m.get("day") or "9999-99-99"
-            matches.sort(key=sort_key)
-            item = matches[0]
-            date_label = item.get("dueDate") or item.get("day") or ""
-            data = {"itemId": item["_id"], "timeZoneOffset": get_tz_offset()}
-            api_request("POST", "markDone", data)
-            date_suffix = f" (due: {date_label})" if date_label else ""
-            print(f"✓ Marked done: {item.get('title', 'Untitled')}{date_suffix}")
-            return
-
-        exit_ambiguous(task_ref, matches, action="marvin done")
-
-    # No regular task matched — check embedded subtasks, then widen the search to
-    # unscheduled tasks (which appear in no day-based list) before giving up.
-    parent, sub_key, subtask = find_embedded_subtask(task_ref, items)
-    if not parent:
-        # Widen to unscheduled tasks and finally an exact doc lookup, which is
-        # the only way to reach a task nested under another task.
-        item = resolve_task(task_ref, extra_items=items)
-        api_request("POST", "markDone",
-                    {"itemId": item["_id"], "timeZoneOffset": get_tz_offset()})
-        print(f"✓ Marked done: {item.get('title', 'Untitled')}")
-        return
+    task_hits = [] if is_full_length_id(task_ref) else [
+        i for i in gather_items(items, upcoming_task_pool(), deep_task_pool())
+        if ref_matches(i, task_ref)
+    ]
+    if len(subs) > 1 or task_hits:
+        exit_ambiguous(task_ref, task_hits + [sub for _, _, sub in subs],
+                       action="marvin done")
+    parent, sub_key, subtask = subs[0]
     if parent:
         now = int(datetime.now().timestamp() * 1000)
         data = {
@@ -1359,24 +1365,14 @@ def cmd_move(args):
     task_ref = args.task_id
     target_date = parse_date(" ".join(args.date)) if args.date else datetime.now().strftime("%Y-%m-%d")
 
-    today_items = api_request("GET", "todayItems", full_access=True) or []
-    due_items = api_request("GET", "dueItems", full_access=True) or []
-    sources = [today_items, due_items]
-
+    # resolve_task already covers today, due, and the upcoming days; --from adds
+    # a day outside that window (such as a past day).
+    extra = []
     if args.from_date:
         source_date = parse_date(" ".join(args.from_date))
-        source_items = api_request("GET", "todayItems", {"date": source_date}, full_access=True) or []
-        sources.append(source_items)
+        extra = api_request("GET", "todayItems", {"date": source_date}, full_access=True) or []
 
-    # Also search upcoming 14 days to find scheduled tasks
-    today = datetime.now().date()
-    for i in range(1, 15):
-        future_date = (today + timedelta(days=i)).strftime("%Y-%m-%d")
-        future_items = api_request("GET", "todayItems", {"date": future_date}, full_access=True) or []
-        if future_items:
-            sources.append(future_items)
-
-    item = resolve_task(task_ref, extra_items=gather_items(*sources))
+    item = resolve_task(task_ref, extra_items=extra)
     task_id = item["_id"]
     title = item.get("title", "Untitled")
 
@@ -1666,15 +1662,23 @@ def cmd_reorder(args):
         print("No tasks found for today.")
         sys.exit(1)
 
-    # Build lookup: short_id -> full item
+    # Build lookup: exact id (full id, short_id, and 8-char prefix) -> item.
+    # An 8-char prefix is ambiguous for a large share of this account's tasks,
+    # so it is only registered when exactly one task carries it. Full ids and
+    # the shortest-unique short_id always resolve.
     id_to_item = {}
+    prefix8_counts = {}
     for item in items:
-        sid = short_id(item.get("_id", ""))
-        id_to_item[sid] = item
-        # Also map by full ID prefix
         full_id = item.get("_id", "")
-        if full_id:
-            id_to_item[full_id[:8]] = item
+        if not full_id:
+            continue
+        id_to_item[full_id] = item
+        id_to_item[short_id(full_id)] = item
+        prefix8_counts[full_id[:8]] = prefix8_counts.get(full_id[:8], 0) + 1
+    for item in items:
+        full_id = item.get("_id", "")
+        if full_id and prefix8_counts.get(full_id[:8]) == 1:
+            id_to_item.setdefault(full_id[:8], item)
 
     # Resolve task refs to items
     ordered_items = []
@@ -1683,12 +1687,18 @@ def cmd_reorder(args):
         if ref in id_to_item:
             ordered_items.append(id_to_item[ref])
         else:
-            # Try prefix match
-            matches = [item for sid, item in id_to_item.items() if sid.startswith(ref)]
+            # Try prefix match against full ids, deduped by id
+            matches = {
+                item["_id"]: item
+                for item in items
+                if item.get("_id", "").startswith(ref)
+            }
             if len(matches) == 1:
-                ordered_items.append(matches[0])
+                ordered_items.append(next(iter(matches.values())))
             elif len(matches) > 1:
-                print(f"Ambiguous task ref '{ref}' - matches multiple tasks")
+                print(f"Ambiguous task ref '{ref}' - matches multiple tasks:")
+                for mid in matches:
+                    print(f"      {mid}")
                 sys.exit(1)
             else:
                 print(f"No task found matching '{ref}'")
