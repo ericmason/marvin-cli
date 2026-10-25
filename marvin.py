@@ -464,6 +464,24 @@ def fetch_children(parent_id):
     ) or []
 
 
+def fetch_all_or_exit(fetch, keys, what):
+    """Run fetch(key) for every key concurrently; exit if any fetch fails.
+
+    fetch returns None on failure. Ref resolution needs every list: a list
+    that silently comes back empty can hide the second match that makes a ref
+    ambiguous, so a partial sweep is refused instead of acted on.
+    """
+    with ThreadPoolExecutor(max_workers=POOL_WORKERS) as pool:
+        results = list(pool.map(fetch, keys))
+    failed = [k for k, r in zip(keys, results) if r is None]
+    if failed:
+        print(f"Could not fetch {what} {', '.join(failed[:5])}"
+              f"{' …' if len(failed) > 5 else ''} from the Marvin API.")
+        print("Refusing to resolve a task ref against a partial list; retry, or pass the full id.")
+        sys.exit(1)
+    return gather_items(*results)
+
+
 def day_task_pool(include_done=False, done_date=None):
     """The day-based item pool: today's items, due items, optionally today's done."""
     # todayItems with no date returns the server's notion of today, which a
@@ -500,22 +518,26 @@ def upcoming_task_pool(days=UPCOMING_DAYS):
     def fetch_day(date_str):
         return api_request(
             "GET", "todayItems", {"date": date_str}, full_access=True, tolerant=True
-        ) or []
+        )
 
-    with ThreadPoolExecutor(max_workers=POOL_WORKERS) as pool:
-        return gather_items(*pool.map(fetch_day, dates))
+    return fetch_all_or_exit(fetch_day, dates, "the day list for")
 
 
 def deep_task_pool():
     """Every task filed directly under the root bucket or any category/project.
 
     Reaches unscheduled tasks, which no day-based list returns. Costs one request
-    per category, so it is only used as a fallback when a ref matches nothing.
+    per category, so a full id skips it. Exits if any category fails to load.
     """
     cats = api_request("GET", "categories", full_access=True) or []
     parent_ids = ["unassigned"] + [c["_id"] for c in cats]
-    with ThreadPoolExecutor(max_workers=POOL_WORKERS) as pool:
-        return gather_items(*pool.map(fetch_children, parent_ids))
+
+    def fetch(pid):
+        return api_request(
+            "GET", "children", {"parentId": pid}, full_access=True, tolerant=True
+        )
+
+    return fetch_all_or_exit(fetch, parent_ids, "the tasks under")
 
 
 def resolve_task(task_ref, extra_items=None, include_done=True, allow_deep=True):
@@ -871,18 +893,17 @@ def cmd_done(args):
         mark_done(items[idx - 1])
         return
 
-    # Embedded subtasks live inside their parent's doc, so no task pool holds
-    # them. With none matching, the ref is a task (or project) ref and
-    # resolve_task refuses it if it is ambiguous.
-    subs = find_embedded_subtasks(task_ref, items)
+    # Embedded subtasks live inside their parent's doc, so they are searched in
+    # the same swept pool as tasks. With none matching, the ref is a task (or
+    # project) ref and resolve_task refuses it if it is ambiguous.
+    pool = items if is_full_length_id(task_ref) else gather_items(
+        items, upcoming_task_pool(), deep_task_pool())
+    subs = find_embedded_subtasks(task_ref, pool)
     if not subs:
-        mark_done(resolve_task(task_ref, extra_items=items))
+        mark_done(resolve_task(task_ref, extra_items=pool, allow_deep=False))
         return
 
-    task_hits = [] if is_full_length_id(task_ref) else [
-        i for i in gather_items(items, upcoming_task_pool(), deep_task_pool())
-        if ref_matches(i, task_ref)
-    ]
+    task_hits = [i for i in pool if ref_matches(i, task_ref)]
     if len(subs) > 1 or task_hits:
         exit_ambiguous(task_ref, task_hits + [sub for _, _, sub in subs],
                        action="marvin done")
@@ -1662,23 +1683,9 @@ def cmd_reorder(args):
         print("No tasks found for today.")
         sys.exit(1)
 
-    # Build lookup: exact id (full id, short_id, and 8-char prefix) -> item.
-    # An 8-char prefix is ambiguous for a large share of this account's tasks,
-    # so it is only registered when exactly one task carries it. Full ids and
-    # the shortest-unique short_id always resolve.
-    id_to_item = {}
-    prefix8_counts = {}
-    for item in items:
-        full_id = item.get("_id", "")
-        if not full_id:
-            continue
-        id_to_item[full_id] = item
-        id_to_item[short_id(full_id)] = item
-        prefix8_counts[full_id[:8]] = prefix8_counts.get(full_id[:8], 0) + 1
-    for item in items:
-        full_id = item.get("_id", "")
-        if full_id and prefix8_counts.get(full_id[:8]) == 1:
-            id_to_item.setdefault(full_id[:8], item)
+    # Build lookup: exact full id -> item. Every shorter ref goes through the
+    # prefix match below, which refuses a ref that names more than one task.
+    id_to_item = {item["_id"]: item for item in items if item.get("_id")}
 
     # Resolve task refs to items
     ordered_items = []
