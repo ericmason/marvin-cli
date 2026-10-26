@@ -332,6 +332,32 @@ class PastDaysDigitIdsAndMoveFrom(unittest.TestCase):
                 return e.code, out.getvalue()
         return None, out.getvalue()
 
+    def test_move_refuses_an_unquoted_multi_word_from(self):
+        self.fake.today.append(self.old)  # resolvable without --from
+        for argv in [("move", "02b9e38f", "--from", "next", "monday"),
+                     ("move", "02b9e38f", "--from", "3", "days", "ago")]:
+            with self.subTest(argv):
+                code, out = self.main(*argv)
+                self.assertEqual(code, 1, out)
+                self.assertEqual(self.fake.posts, [])
+                self.assertIn("Error: Could not parse", out)
+
+    def test_quoted_multi_word_from_works(self):
+        three_ago = (marvin.datetime.now().date() - marvin.timedelta(days=3)).isoformat()
+        self.fake.upcoming = {three_ago: [self.old]}
+        code, out = self.main("move", "02b9e38f", "--from", "3 days ago", "tomorrow")
+        self.assertIsNone(code, out)
+        self.assertEqual(self.fake.posts[0][1]["itemId"], self.old["_id"])
+
+    def test_past_day_embedded_subtask_keeps_its_short_id(self):
+        sub_id = "f00dfeed" + "0" * 24
+        self.old["subtasks"] = {sub_id: {"_id": sub_id, "title": "Sub", "done": False}}
+        code, out = run(marvin.cmd_day, date=[PAST_DAY], incomplete=True, all=False,
+                        snoozed=False, subtasks=False)
+        self.assertIsNone(code, out)
+        self.assertIn(f"({self.old['_id']})", out)
+        self.assertIn("(f00dfeed)", out)
+
     def test_move_from_takes_one_date_in_any_position(self):
         target = IN_TWO_DAYS
         for argv in [("move", "02b9e38f", "--from", PAST_DAY),
@@ -392,10 +418,15 @@ class DoneByListNumber(unittest.TestCase):
                 self.assertTrue(done_id.startswith(sid), (number, done_id))
                 self.assertIn(done_id, by_id)
 
-    def test_number_past_the_list_is_not_a_list_number(self):
-        code, out = run(marvin.cmd_done, task_id="4")
-        self.assertEqual(code, 1, out)
-        self.assertEqual(self.fake.posts, [])
+    def test_number_past_the_list_is_refused_even_when_it_prefixes_an_id(self):
+        # "12" fits no list position but is a unique prefix of a backlog task.
+        self.fake.children = {"unassigned": [task("12aa0000000000000000000000000000", "Backlog")]}
+        for ref in ("4", "12", "1234567"):
+            with self.subTest(ref):
+                code, out = run(marvin.cmd_done, task_id=ref)
+                self.assertEqual(code, 1, out)
+                self.assertEqual(self.fake.posts, [])
+                self.assertIn("Invalid task number", out)
 
 
 class DisplayIds(unittest.TestCase):

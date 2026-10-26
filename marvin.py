@@ -839,7 +839,9 @@ def show_tasks_for_date(date_str, show_incomplete_only=False, include_completed=
 
     uids = display_ids(items, [c for kids in children_by_parent.values() for c in kids])
     if not in_resolve_window(date_str):
-        uids = {raw_id: raw_id for raw_id in uids}
+        # Tasks only: an embedded subtask lives inside its parent's doc, so an
+        # exact doc lookup can't find it and its shortened prefix stays.
+        uids.update({i.get("_id", ""): i.get("_id", "") for i in items})
     if show_children:
         uids.update(nested_child_ids([c for kids in fetched.values() for c in kids]))
 
@@ -933,12 +935,17 @@ def cmd_done(args):
 
     # A short number that fits the list is the position plain 'marvin today'
     # printed, so it is looked up in that same list, built the same way.
-    if task_ref.isdigit() and len(task_ref) <= 3:
+    # A short all-digit ref that doesn't fit the list is a mistyped or stale list
+    # number, not an id: no listing prints an id under 8 characters, and as a
+    # prefix it could match some unrelated task.
+    if task_ref.isdigit() and len(task_ref) < 8:
         numbered = today_numbered_tasks()
         idx = list_number(task_ref, numbered)
         if idx:
             mark_done(numbered[idx - 1])
             return
+        print(f"Invalid task number '{task_ref}'. 'marvin today' lists 1-{len(numbered)}.")
+        sys.exit(1)
 
     # Embedded subtasks live inside their parent's doc, so they are searched in
     # the same swept pool as tasks. With none matching, the ref is a task (or
@@ -1428,16 +1435,34 @@ def cmd_estimate(args):
     print(f"✓ Set estimate for '{title[:50]}' to {minutes}m")
 
 
+def parse_date_or_exit(text, what="date"):
+    """parse_date, but exit on anything that isn't a real YYYY-MM-DD date.
+
+    parse_date passes unparseable text through, which move would write as the
+    task's day. An unquoted multi-word --from ('--from next monday') splits into
+    '--from next' and a target of 'monday', so this has to be a hard error.
+    """
+    result = parse_date(text)
+    try:
+        datetime.strptime(result, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        print(f"Error: Could not parse {what} '{text}'. Quote a multi-word date: "
+              f"--from \"next monday\".")
+        sys.exit(1)
+    return result
+
+
 def cmd_move(args):
     """Move/reschedule a task to a different day."""
     task_ref = args.task_id
-    target_date = parse_date(" ".join(args.date)) if args.date else datetime.now().strftime("%Y-%m-%d")
+    target_date = (parse_date_or_exit(" ".join(args.date)) if args.date
+                   else datetime.now().strftime("%Y-%m-%d"))
 
     # resolve_task already covers today, due, and the upcoming days; --from adds
     # a day outside that window (such as a past day).
     extra = []
     if args.from_date:
-        source_date = parse_date(args.from_date)
+        source_date = parse_date_or_exit(args.from_date, "--from")
         extra = api_request("GET", "todayItems", {"date": source_date}, full_access=True) or []
 
     item = resolve_task(task_ref, extra_items=extra)
