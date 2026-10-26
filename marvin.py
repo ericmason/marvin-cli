@@ -523,6 +523,34 @@ def upcoming_task_pool(days=UPCOMING_DAYS):
     return fetch_all_or_exit(fetch_day, dates, "the day list for")
 
 
+def in_resolve_window(date_str):
+    """True if a prefix shown in date_str's listing can be resolved back.
+
+    The day-based pools cover today through the next UPCOMING_DAYS days. A task
+    on any other day is reached only through the category sweep, which misses
+    some tasks (a past-day task can fail to resolve even though 'marvin day'
+    listed it), so listings for those days show full ids, which resolve_task
+    finds by exact doc lookup.
+    """
+    try:
+        day = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return False
+    today = datetime.now().date()
+    return today <= day <= today + timedelta(days=UPCOMING_DAYS)
+
+
+def list_number(task_ref, items):
+    """The 1-based list index task_ref names, or None if it is a task id.
+
+    Marvin ids can be all digits ('27102153'), so only a short number that fits
+    the list counts as a position; anything else is resolved as an id.
+    """
+    if task_ref.isdigit() and len(task_ref) <= 3 and 1 <= int(task_ref) <= len(items):
+        return int(task_ref)
+    return None
+
+
 def deep_task_pool():
     """Every task filed directly under the root bucket or any category/project.
 
@@ -568,7 +596,8 @@ def resolve_task(task_ref, extra_items=None, include_done=True, allow_deep=True)
     print(f"No task found matching '{task_ref}'")
     print(f"Tried today/due/done lists, the next {UPCOMING_DAYS} days, every category, and an exact id lookup.")
     print("A task nested under another task resolves only by its FULL id —")
-    print("run 'marvin subtasks <parent>' to get it.")
+    print("run 'marvin subtasks <parent>' to get it. For a task on a past day,")
+    print("'marvin day <date>' prints its full id.")
     sys.exit(1)
 
 
@@ -716,6 +745,43 @@ def cmd_day(args):
                         show_children=getattr(args, "subtasks", False))
 
 
+def hide_snoozed(items, now=None):
+    """Split off snoozed, incomplete tasks: returns (visible items, {id: wake})."""
+    snoozed_wakes = {}
+    for item in items:
+        wake = snoozed_until(item, now)
+        if wake and not item.get("done"):
+            snoozed_wakes[item.get("_id")] = wake
+    visible = [i for i in items if i.get("_id") not in snoozed_wakes]
+    return visible, snoozed_wakes
+
+
+def split_top_level(items):
+    """Returns (top-level items sorted by rank, {parent id: [child items]}).
+
+    A child task whose parent is in the same list is nested under it; the rest
+    are top level. The top-level order is the numbering 'marvin today' prints.
+    """
+    items_by_id = {item.get("_id"): item for item in items}
+    children_by_parent = {}
+    top_level = []
+    for item in items:
+        parent_id = item.get("parentId")
+        if parent_id and parent_id in items_by_id:
+            children_by_parent.setdefault(parent_id, []).append(item)
+        else:
+            top_level.append(item)
+    # Sort by rank (lower = higher priority)
+    return sorted(top_level, key=lambda x: x.get("rank", 999999)), children_by_parent
+
+
+def today_numbered_tasks():
+    """The top-level tasks in the order plain 'marvin today' numbers them."""
+    local_today = datetime.now().strftime("%Y-%m-%d")
+    items = api_request("GET", "todayItems", {"date": local_today}, full_access=True) or []
+    return split_top_level(hide_snoozed(items)[0])[0]
+
+
 def show_tasks_for_date(date_str, show_incomplete_only=False, include_completed=False,
                         show_snoozed=False, show_children=False):
     """Display tasks for a given date."""
@@ -730,15 +796,11 @@ def show_tasks_for_date(date_str, show_incomplete_only=False, include_completed=
     # The Marvin app hides snoozed tasks everywhere except the master list, so
     # hide them here too (with a count) unless --snoozed asks to show them.
     now = datetime.now()
-    snoozed_wakes = {}
-    for item in items:
-        wake = snoozed_until(item, now)
-        if wake and not item.get("done"):
-            snoozed_wakes[item.get("_id")] = wake
+    visible, snoozed_wakes = hide_snoozed(items, now)
     hidden_count = 0
     if not show_snoozed and snoozed_wakes:
         hidden_count = len(snoozed_wakes)
-        items = [i for i in items if i.get("_id") not in snoozed_wakes]
+        items = visible
 
     if not items:
         if hidden_count:
@@ -754,22 +816,8 @@ def show_tasks_for_date(date_str, show_incomplete_only=False, include_completed=
             print(f"No incomplete tasks for {date_str}.")
             return
 
-    # Build parent-child relationships
     items_by_id = {item.get("_id"): item for item in items}
-    children_by_parent = {}
-    top_level = []
-
-    for item in items:
-        parent_id = item.get("parentId")
-        if parent_id and parent_id in items_by_id:
-            if parent_id not in children_by_parent:
-                children_by_parent[parent_id] = []
-            children_by_parent[parent_id].append(item)
-        else:
-            top_level.append(item)
-
-    # Sort by rank (lower = higher priority)
-    top_level = sorted(top_level, key=lambda x: x.get("rank", 999999))
+    top_level, children_by_parent = split_top_level(items)
 
     # Unscheduled children live in no day-based list, so they can only be reached
     # through the children endpoint — one request per top-level task, hence opt-in.
@@ -790,6 +838,10 @@ def show_tasks_for_date(date_str, show_incomplete_only=False, include_completed=
         return f" 💤 until {format_wake(wake, now)}" if wake else ""
 
     uids = display_ids(items, [c for kids in children_by_parent.values() for c in kids])
+    if not in_resolve_window(date_str):
+        # Tasks only: an embedded subtask lives inside its parent's doc, so an
+        # exact doc lookup can't find it and its shortened prefix stays.
+        uids.update({i.get("_id", ""): i.get("_id", "") for i in items})
     if show_children:
         uids.update(nested_child_ids([c for kids in fetched.values() for c in kids]))
 
@@ -881,17 +933,19 @@ def cmd_done(args):
     due_items = api_request("GET", "dueItems", full_access=True) or []
     items = gather_items(today_items, done_items, due_items)
 
-    # Check if it's a number (list index for top-level tasks)
-    if task_ref.isdigit():
-        if not items:
-            print("No tasks found for today.")
-            sys.exit(1)
-        idx = int(task_ref)
-        if idx < 1 or idx > len(items):
-            print(f"Invalid task number. Use 1-{len(items)}.")
-            sys.exit(1)
-        mark_done(items[idx - 1])
-        return
+    # A short number that fits the list is the position plain 'marvin today'
+    # printed, so it is looked up in that same list, built the same way.
+    # A short all-digit ref that doesn't fit the list is a mistyped or stale list
+    # number, not an id: no listing prints an id under 8 characters, and as a
+    # prefix it could match some unrelated task.
+    if task_ref.isdigit() and len(task_ref) < 8:
+        numbered = today_numbered_tasks()
+        idx = list_number(task_ref, numbered)
+        if idx:
+            mark_done(numbered[idx - 1])
+            return
+        print(f"Invalid task number '{task_ref}'. 'marvin today' lists 1-{len(numbered)}.")
+        sys.exit(1)
 
     # Embedded subtasks live inside their parent's doc, so they are searched in
     # the same swept pool as tasks. With none matching, the ref is a task (or
@@ -1381,16 +1435,34 @@ def cmd_estimate(args):
     print(f"✓ Set estimate for '{title[:50]}' to {minutes}m")
 
 
+def parse_date_or_exit(text, what="date"):
+    """parse_date, but exit on anything that isn't a real YYYY-MM-DD date.
+
+    parse_date passes unparseable text through, which move would write as the
+    task's day. An unquoted multi-word --from ('--from next monday') splits into
+    '--from next' and a target of 'monday', so this has to be a hard error.
+    """
+    result = parse_date(text)
+    try:
+        datetime.strptime(result, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        print(f"Error: Could not parse {what} '{text}'. Quote a multi-word date: "
+              f"--from \"next monday\".")
+        sys.exit(1)
+    return result
+
+
 def cmd_move(args):
     """Move/reschedule a task to a different day."""
     task_ref = args.task_id
-    target_date = parse_date(" ".join(args.date)) if args.date else datetime.now().strftime("%Y-%m-%d")
+    target_date = (parse_date_or_exit(" ".join(args.date)) if args.date
+                   else datetime.now().strftime("%Y-%m-%d"))
 
     # resolve_task already covers today, due, and the upcoming days; --from adds
     # a day outside that window (such as a past day).
     extra = []
     if args.from_date:
-        source_date = parse_date(" ".join(args.from_date))
+        source_date = parse_date_or_exit(args.from_date, "--from")
         extra = api_request("GET", "todayItems", {"date": source_date}, full_access=True) or []
 
     item = resolve_task(task_ref, extra_items=extra)
@@ -1940,7 +2012,8 @@ Date formats for 'day' command:
     sub = subparsers.add_parser("move", help="Move/reschedule a task to a different day")
     sub.add_argument("task_id", help="Task ID (or prefix)")
     sub.add_argument("date", nargs="*", help="Target date (default: today)")
-    sub.add_argument("--from", "-f", dest="from_date", nargs="+", help="Source date to search for task")
+    sub.add_argument("--from", "-f", dest="from_date",
+                     help="Source date to search for task (one value; quote a multi-word date)")
     sub.set_defaults(func=cmd_move)
 
     # snooze - hide a task from today's view until a wake time

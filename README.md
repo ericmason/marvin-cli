@@ -71,6 +71,7 @@ marvin add "Deploy" -d next monday  # Schedule for a date
 marvin done abc123                  # Complete a task, project, or subtask
 marvin estimate abc123 30           # Set a 30-minute estimate
 marvin move abc123 tomorrow         # Reschedule to another day
+marvin move abc123 --from 2026-07-21  # Also search a past day's list (one date)
 marvin snooze abc123 4h             # Hide from today until 4 hours from now
 marvin unsnooze abc123              # Wake a snoozed task early
 marvin snoozed                      # List snoozed tasks with wake times
