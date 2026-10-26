@@ -745,6 +745,43 @@ def cmd_day(args):
                         show_children=getattr(args, "subtasks", False))
 
 
+def hide_snoozed(items, now=None):
+    """Split off snoozed, incomplete tasks: returns (visible items, {id: wake})."""
+    snoozed_wakes = {}
+    for item in items:
+        wake = snoozed_until(item, now)
+        if wake and not item.get("done"):
+            snoozed_wakes[item.get("_id")] = wake
+    visible = [i for i in items if i.get("_id") not in snoozed_wakes]
+    return visible, snoozed_wakes
+
+
+def split_top_level(items):
+    """Returns (top-level items sorted by rank, {parent id: [child items]}).
+
+    A child task whose parent is in the same list is nested under it; the rest
+    are top level. The top-level order is the numbering 'marvin today' prints.
+    """
+    items_by_id = {item.get("_id"): item for item in items}
+    children_by_parent = {}
+    top_level = []
+    for item in items:
+        parent_id = item.get("parentId")
+        if parent_id and parent_id in items_by_id:
+            children_by_parent.setdefault(parent_id, []).append(item)
+        else:
+            top_level.append(item)
+    # Sort by rank (lower = higher priority)
+    return sorted(top_level, key=lambda x: x.get("rank", 999999)), children_by_parent
+
+
+def today_numbered_tasks():
+    """The top-level tasks in the order plain 'marvin today' numbers them."""
+    local_today = datetime.now().strftime("%Y-%m-%d")
+    items = api_request("GET", "todayItems", {"date": local_today}, full_access=True) or []
+    return split_top_level(hide_snoozed(items)[0])[0]
+
+
 def show_tasks_for_date(date_str, show_incomplete_only=False, include_completed=False,
                         show_snoozed=False, show_children=False):
     """Display tasks for a given date."""
@@ -759,15 +796,11 @@ def show_tasks_for_date(date_str, show_incomplete_only=False, include_completed=
     # The Marvin app hides snoozed tasks everywhere except the master list, so
     # hide them here too (with a count) unless --snoozed asks to show them.
     now = datetime.now()
-    snoozed_wakes = {}
-    for item in items:
-        wake = snoozed_until(item, now)
-        if wake and not item.get("done"):
-            snoozed_wakes[item.get("_id")] = wake
+    visible, snoozed_wakes = hide_snoozed(items, now)
     hidden_count = 0
     if not show_snoozed and snoozed_wakes:
         hidden_count = len(snoozed_wakes)
-        items = [i for i in items if i.get("_id") not in snoozed_wakes]
+        items = visible
 
     if not items:
         if hidden_count:
@@ -783,22 +816,8 @@ def show_tasks_for_date(date_str, show_incomplete_only=False, include_completed=
             print(f"No incomplete tasks for {date_str}.")
             return
 
-    # Build parent-child relationships
     items_by_id = {item.get("_id"): item for item in items}
-    children_by_parent = {}
-    top_level = []
-
-    for item in items:
-        parent_id = item.get("parentId")
-        if parent_id and parent_id in items_by_id:
-            if parent_id not in children_by_parent:
-                children_by_parent[parent_id] = []
-            children_by_parent[parent_id].append(item)
-        else:
-            top_level.append(item)
-
-    # Sort by rank (lower = higher priority)
-    top_level = sorted(top_level, key=lambda x: x.get("rank", 999999))
+    top_level, children_by_parent = split_top_level(items)
 
     # Unscheduled children live in no day-based list, so they can only be reached
     # through the children endpoint — one request per top-level task, hence opt-in.
@@ -912,11 +931,14 @@ def cmd_done(args):
     due_items = api_request("GET", "dueItems", full_access=True) or []
     items = gather_items(today_items, done_items, due_items)
 
-    # A short number that fits the list is a list index for top-level tasks
-    idx = list_number(task_ref, items)
-    if idx:
-        mark_done(items[idx - 1])
-        return
+    # A short number that fits the list is the position plain 'marvin today'
+    # printed, so it is looked up in that same list, built the same way.
+    if task_ref.isdigit() and len(task_ref) <= 3:
+        numbered = today_numbered_tasks()
+        idx = list_number(task_ref, numbered)
+        if idx:
+            mark_done(numbered[idx - 1])
+            return
 
     # Embedded subtasks live inside their parent's doc, so they are searched in
     # the same swept pool as tasks. With none matching, the ref is a task (or

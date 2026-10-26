@@ -249,6 +249,7 @@ class ReviewFollowUps(unittest.TestCase):
 
 
 PAST_DAY = (marvin.datetime.now().date() - marvin.timedelta(days=95)).isoformat()
+TODAY = marvin.datetime.now().strftime("%Y-%m-%d")
 
 
 class PastDaysDigitIdsAndMoveFrom(unittest.TestCase):
@@ -262,7 +263,7 @@ class PastDaysDigitIdsAndMoveFrom(unittest.TestCase):
         self.b = task("bbcdef12bbbbbbbbbbbbbbbbbbbbbbbb", "B", day="2026-10-25")
         self.fake = FakeMarvin(
             today=[self.a, self.b],
-            upcoming={PAST_DAY: [self.old]},
+            upcoming={PAST_DAY: [self.old], TODAY: [self.a, self.b]},
             children={"unassigned": [self.digits]},
             docs={t["_id"]: t for t in (self.old, self.digits, self.a, self.b)},
         )
@@ -346,6 +347,55 @@ class PastDaysDigitIdsAndMoveFrom(unittest.TestCase):
                 day = {s["key"]: s["val"] for s in data["setters"]}["day"]
                 expected = target if len(argv) == 5 else marvin.datetime.now().strftime("%Y-%m-%d")
                 self.assertEqual(day, expected)
+
+
+class DoneByListNumber(unittest.TestCase):
+    """'marvin done N' completes the task 'marvin today' printed as N."""
+
+    def setUp(self):
+        later = int((marvin.datetime.now() + marvin.timedelta(hours=3)).timestamp() * 1000)
+        # API order differs from rank order; one task is snoozed, one is a child,
+        # and the server's undated todayItems and the due list hold other tasks.
+        self.listed = [
+            task("b3f81f9e000000000000000000000000", "CLAUDE.md task", day=TODAY, rank=30),
+            task("5a0000000000000000000000000000aa", "Snoozed", day=TODAY, rank=5,
+                 itemSnoozeTime=later),
+            task("8326f130000000000000000000000000", "Top task", day=TODAY, rank=10),
+            task("c4000000000000000000000000000000", "Child", day=TODAY, rank=1,
+                 parentId="8326f130000000000000000000000000"),
+            task("d5000000000000000000000000000000", "Middle", day=TODAY, rank=20),
+        ]
+        self.fake = FakeMarvin(
+            today=[task("e6000000000000000000000000000000", "Server-today only", rank=0)],
+            upcoming={TODAY: self.listed},
+        )
+        patcher = mock.patch.object(marvin, "api_request", self.fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_every_number_today_prints_completes_that_task(self):
+        code, out = run(marvin.cmd_today, date=None, all=False, snoozed=False, subtasks=False)
+        self.assertIsNone(code, out)
+        shown = {}
+        for line in out.splitlines():
+            head = line.strip().split(". ", 1)
+            if head[0].isdigit():
+                shown[head[0]] = line.rsplit("(", 1)[1].rstrip(")")
+        self.assertEqual(list(shown.values()), ["8326f130", "d5000000", "b3f81f9e"])
+        by_id = {t["_id"]: t for t in self.listed}
+        for number, sid in shown.items():
+            with self.subTest(number):
+                self.fake.posts = []
+                code, out = run(marvin.cmd_done, task_id=number)
+                self.assertIsNone(code, out)
+                done_id = self.fake.posts[0][1]["itemId"]
+                self.assertTrue(done_id.startswith(sid), (number, done_id))
+                self.assertIn(done_id, by_id)
+
+    def test_number_past_the_list_is_not_a_list_number(self):
+        code, out = run(marvin.cmd_done, task_id="4")
+        self.assertEqual(code, 1, out)
+        self.assertEqual(self.fake.posts, [])
 
 
 class DisplayIds(unittest.TestCase):
