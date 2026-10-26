@@ -248,6 +248,106 @@ class ReviewFollowUps(unittest.TestCase):
             self.assertIs(marvin.resolve_task(self.b["_id"]), self.b)
 
 
+PAST_DAY = (marvin.datetime.now().date() - marvin.timedelta(days=95)).isoformat()
+
+
+class PastDaysDigitIdsAndMoveFrom(unittest.TestCase):
+    """Ids from a past day's listing, all-digit ids, and 'move --from'."""
+
+    def setUp(self):
+        # On a past day only: in no swept pool, reachable by doc lookup alone.
+        self.old = task("02b9e38f1c4d4b6e9a7f0c2d3e4f5a6b", "July task", day=PAST_DAY)
+        self.digits = task("27102153884401", "Digit-id task")
+        self.a = task("abcdef12aaaaaaaaaaaaaaaaaaaaaaaa", "A", day="2026-10-25")
+        self.b = task("bbcdef12bbbbbbbbbbbbbbbbbbbbbbbb", "B", day="2026-10-25")
+        self.fake = FakeMarvin(
+            today=[self.a, self.b],
+            upcoming={PAST_DAY: [self.old]},
+            children={"unassigned": [self.digits]},
+            docs={t["_id"]: t for t in (self.old, self.digits, self.a, self.b)},
+        )
+        patcher = mock.patch.object(marvin, "api_request", self.fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def shown_id(self, date):
+        code, out = run(marvin.cmd_day, date=[date], incomplete=True, all=False,
+                        snoozed=False, subtasks=False)
+        self.assertIsNone(code, out)
+        return out.split("(")[-1].split(")")[0]
+
+    def test_past_day_listing_prints_the_full_id(self):
+        self.assertEqual(self.shown_id(PAST_DAY), self.old["_id"])
+
+    def test_upcoming_day_listing_keeps_the_short_id(self):
+        self.fake.upcoming = {IN_TWO_DAYS: [self.old]}
+        self.assertEqual(self.shown_id(IN_TWO_DAYS), "02b9e38f")
+
+    def test_every_command_resolves_the_id_a_past_day_listing_prints(self):
+        ref = self.shown_id(PAST_DAY)
+        for func, kwargs in [(marvin.cmd_done, dict(task_id=ref)),
+                             (marvin.cmd_snooze, dict(task_id=ref, duration=["2h"])),
+                             (marvin.cmd_estimate, dict(task_id=ref, minutes=30)),
+                             (marvin.cmd_rm, dict(task_id=ref, force=True))]:
+            with self.subTest(func.__name__):
+                self.fake.posts = []
+                code, out = run(func, **kwargs)
+                self.assertIsNone(code, out)
+                self.assertEqual(self.fake.posts[0][1]["itemId"], self.old["_id"])
+
+    def test_short_past_day_prefix_is_not_found(self):
+        code, out = run(marvin.cmd_done, task_id="02b9e38f")
+        self.assertEqual(code, 1, out)
+        self.assertEqual(self.fake.posts, [])
+        self.assertIn("'marvin day <date>' prints its full id", out)
+
+    def test_all_digit_id_is_resolved_as_an_id(self):
+        code, out = run(marvin.cmd_done, task_id="27102153")
+        self.assertIsNone(code, out)
+        self.assertNotIn("Invalid task number", out)
+        self.assertEqual(self.fake.posts, [("markDone", {"itemId": self.digits["_id"],
+                                                          "timeZoneOffset": marvin.get_tz_offset()})])
+
+    def test_short_number_in_range_is_a_list_number(self):
+        code, out = run(marvin.cmd_done, task_id="2")
+        self.assertIsNone(code, out)
+        self.assertEqual(self.fake.posts[0][1]["itemId"], self.b["_id"])
+
+    def test_list_number_rules(self):
+        items = [self.a, self.b]
+        self.assertEqual(marvin.list_number("1", items), 1)
+        self.assertIsNone(marvin.list_number("3", items))
+        self.assertIsNone(marvin.list_number("0", items))
+        self.assertIsNone(marvin.list_number("0002", items))
+        self.assertIsNone(marvin.list_number("27102153", items))
+        self.assertIsNone(marvin.list_number("abc", items))
+
+    def main(self, *argv):
+        out = io.StringIO()
+        with mock.patch.object(sys, "argv", ["marvin", *argv]), contextlib.redirect_stdout(out):
+            try:
+                marvin.main()
+            except SystemExit as e:
+                return e.code, out.getvalue()
+        return None, out.getvalue()
+
+    def test_move_from_takes_one_date_in_any_position(self):
+        target = IN_TWO_DAYS
+        for argv in [("move", "02b9e38f", "--from", PAST_DAY),
+                     ("move", "02b9e38f", "--from", PAST_DAY, target),
+                     ("move", "02b9e38f", target, "--from", PAST_DAY),
+                     ("move", "--from", PAST_DAY, "02b9e38f", target)]:
+            with self.subTest(argv):
+                self.fake.posts = []
+                code, out = self.main(*argv)
+                self.assertIsNone(code, out)
+                endpoint, data = self.fake.posts[0]
+                self.assertEqual((endpoint, data["itemId"]), ("doc/update", self.old["_id"]))
+                day = {s["key"]: s["val"] for s in data["setters"]}["day"]
+                expected = target if len(argv) == 5 else marvin.datetime.now().strftime("%Y-%m-%d")
+                self.assertEqual(day, expected)
+
+
 class DisplayIds(unittest.TestCase):
     def test_recurring_instances_display_their_full_id(self):
         items = [task(STRAY, "a"), task(OCT27, "b"), task("abcdef1234567890", "c")]

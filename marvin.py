@@ -523,6 +523,34 @@ def upcoming_task_pool(days=UPCOMING_DAYS):
     return fetch_all_or_exit(fetch_day, dates, "the day list for")
 
 
+def in_resolve_window(date_str):
+    """True if a prefix shown in date_str's listing can be resolved back.
+
+    The day-based pools cover today through the next UPCOMING_DAYS days. A task
+    on any other day is reached only through the category sweep, which misses
+    some tasks (a past-day task can fail to resolve even though 'marvin day'
+    listed it), so listings for those days show full ids, which resolve_task
+    finds by exact doc lookup.
+    """
+    try:
+        day = datetime.strptime(date_str, "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return False
+    today = datetime.now().date()
+    return today <= day <= today + timedelta(days=UPCOMING_DAYS)
+
+
+def list_number(task_ref, items):
+    """The 1-based list index task_ref names, or None if it is a task id.
+
+    Marvin ids can be all digits ('27102153'), so only a short number that fits
+    the list counts as a position; anything else is resolved as an id.
+    """
+    if task_ref.isdigit() and len(task_ref) <= 3 and 1 <= int(task_ref) <= len(items):
+        return int(task_ref)
+    return None
+
+
 def deep_task_pool():
     """Every task filed directly under the root bucket or any category/project.
 
@@ -568,7 +596,8 @@ def resolve_task(task_ref, extra_items=None, include_done=True, allow_deep=True)
     print(f"No task found matching '{task_ref}'")
     print(f"Tried today/due/done lists, the next {UPCOMING_DAYS} days, every category, and an exact id lookup.")
     print("A task nested under another task resolves only by its FULL id —")
-    print("run 'marvin subtasks <parent>' to get it.")
+    print("run 'marvin subtasks <parent>' to get it. For a task on a past day,")
+    print("'marvin day <date>' prints its full id.")
     sys.exit(1)
 
 
@@ -790,6 +819,8 @@ def show_tasks_for_date(date_str, show_incomplete_only=False, include_completed=
         return f" 💤 until {format_wake(wake, now)}" if wake else ""
 
     uids = display_ids(items, [c for kids in children_by_parent.values() for c in kids])
+    if not in_resolve_window(date_str):
+        uids = {raw_id: raw_id for raw_id in uids}
     if show_children:
         uids.update(nested_child_ids([c for kids in fetched.values() for c in kids]))
 
@@ -881,15 +912,9 @@ def cmd_done(args):
     due_items = api_request("GET", "dueItems", full_access=True) or []
     items = gather_items(today_items, done_items, due_items)
 
-    # Check if it's a number (list index for top-level tasks)
-    if task_ref.isdigit():
-        if not items:
-            print("No tasks found for today.")
-            sys.exit(1)
-        idx = int(task_ref)
-        if idx < 1 or idx > len(items):
-            print(f"Invalid task number. Use 1-{len(items)}.")
-            sys.exit(1)
+    # A short number that fits the list is a list index for top-level tasks
+    idx = list_number(task_ref, items)
+    if idx:
         mark_done(items[idx - 1])
         return
 
@@ -1390,7 +1415,7 @@ def cmd_move(args):
     # a day outside that window (such as a past day).
     extra = []
     if args.from_date:
-        source_date = parse_date(" ".join(args.from_date))
+        source_date = parse_date(args.from_date)
         extra = api_request("GET", "todayItems", {"date": source_date}, full_access=True) or []
 
     item = resolve_task(task_ref, extra_items=extra)
@@ -1940,7 +1965,8 @@ Date formats for 'day' command:
     sub = subparsers.add_parser("move", help="Move/reschedule a task to a different day")
     sub.add_argument("task_id", help="Task ID (or prefix)")
     sub.add_argument("date", nargs="*", help="Target date (default: today)")
-    sub.add_argument("--from", "-f", dest="from_date", nargs="+", help="Source date to search for task")
+    sub.add_argument("--from", "-f", dest="from_date",
+                     help="Source date to search for task (one value; quote a multi-word date)")
     sub.set_defaults(func=cmd_move)
 
     # snooze - hide a task from today's view until a wake time
