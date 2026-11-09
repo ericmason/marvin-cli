@@ -1337,16 +1337,17 @@ def cmd_category(args):
         print("  … (200-item API cap hit — list may be truncated)")
 
 
-def cmd_backlog(args):
-    """List open, unscheduled tasks (day == unassigned) so nothing gets forgotten.
+def gather_backlog(uncategorized_only=False):
+    """Collect open, unscheduled tasks (day == unassigned), grouped by category.
 
     An unscheduled task lives under whatever category it is filed in (or the root
     'unassigned' bucket if uncategorized), so this walks the root plus every
-    category/project and collects everything with no scheduled day.
+    category/project. Returns (groups, truncated): groups is [(label, [tasks])],
+    truncated lists parents that hit the 200-item API cap. Read-only.
     """
     cats = api_request("GET", "categories", full_access=True) or []
     parents = [("(uncategorized)", "unassigned")]
-    if not args.uncategorized:
+    if not uncategorized_only:
         parents += [(c.get("title", "Untitled"), c["_id"]) for c in cats]
 
     groups = []       # (label, [tasks])
@@ -1361,6 +1362,12 @@ def cmd_backlog(args):
         ]
         if open_unsched:
             groups.append((label, open_unsched))
+    return groups, truncated
+
+
+def cmd_backlog(args):
+    """List open, unscheduled tasks (day == unassigned) so nothing gets forgotten."""
+    groups, truncated = gather_backlog(args.uncategorized)
 
     total = sum(len(t) for _, t in groups)
     if not total:
@@ -1673,7 +1680,9 @@ def cmd_search(args):
 
     today_items = api_request("GET", "todayItems", full_access=True) or []
     due_items = api_request("GET", "dueItems", full_access=True) or []
-    sources = [today_items, due_items, upcoming_task_pool()]
+    backlog_groups, _ = gather_backlog()
+    backlog_items = [it for _, tasks in backlog_groups for it in tasks]
+    sources = [today_items, due_items, upcoming_task_pool(), backlog_items]
 
     today = datetime.now().date()
     if args.all:

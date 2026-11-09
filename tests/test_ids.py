@@ -440,5 +440,37 @@ class DisplayIds(unittest.TestCase):
         self.assertEqual(marvin.short_id("abcdef1234567890"), "abcdef12")
 
 
+class SearchIncludesBacklog(unittest.TestCase):
+    def setUp(self):
+        self.backlog = task("bl1", "Jon-Luke battle.net: tell Nick")
+        self.filed = task("bl2", "Start the audit with Mythos")
+        self.done = task("bl3", "Old battle task", done=True)
+        self.fake = FakeMarvin(
+            children={"unassigned": [self.backlog, self.done], "cat1": [self.filed, self.backlog]},
+            categories=[{"_id": "cat1", "title": "Security"}],
+        )
+        patcher = mock.patch.object(marvin, "api_request", self.fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def search(self, *words):
+        return run(marvin.cmd_search, query=list(words), all=False)
+
+    def test_finds_uncategorized_backlog_task(self):
+        code, out = self.search("battle")
+        self.assertIsNone(code)
+        self.assertIn("battle.net", out)
+        self.assertNotIn("Old battle task", out)
+
+    def test_finds_categorized_backlog_task(self):
+        _, out = self.search("Mythos")
+        self.assertIn("Start the audit with Mythos", out)
+
+    def test_dedupes_by_id_and_stays_read_only(self):
+        _, out = self.search("battle")
+        self.assertEqual(out.count("battle.net"), 1)
+        self.assertEqual(self.fake.posts, [])
+
+
 if __name__ == "__main__":
     unittest.main()
