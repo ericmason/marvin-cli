@@ -440,6 +440,76 @@ class DisplayIds(unittest.TestCase):
         self.assertEqual(marvin.short_id("abcdef1234567890"), "abcdef12")
 
 
+_no_sync = mock.patch.object(marvin, "sync_credentials", lambda: None)
+
+
+def setUpModule():
+    """Default every test to no sync credentials, whatever this machine's config
+    holds, so no test can reach a real sync database. The tests that exercise the
+    sync route patch it again themselves."""
+    _no_sync.start()
+
+
+def tearDownModule():
+    _no_sync.stop()
+
+
+class FakeSyncDB:
+    """Stands in for the sync database at marvin's single HTTP seam.
+
+    Serves _find in pages of marvin.SYNC_PAGE with a bookmark, as CouchDB does,
+    and _all_docs for the fallback path. find_fails=True makes _find unavailable.
+    """
+
+    CREDS = {
+        "sync_server": "https://sync.example.com",
+        "sync_database": "db-eric",
+        "sync_user": "eric",
+        "sync_password": "secret",
+    }
+
+    def __init__(self, docs, find_fails=False):
+        self.docs = list(docs)
+        self.find_fails = find_fails
+        self.calls = []
+
+    def install(self, testcase):
+        for name, value in (("sync_credentials", lambda: dict(self.CREDS)),
+                            ("sync_http", self)):
+            patcher = mock.patch.object(marvin, name, value)
+            patcher.start()
+            testcase.addCleanup(patcher.stop)
+        return self
+
+    def matching(self, body):
+        """The docs a Mango selector of the shape marvin sends would return."""
+        selector = body["selector"]
+        wanted = selector["db"]["$in"]
+        out = [d for d in self.docs if d.get("db") in wanted]
+        if "done" in selector:
+            out = [d for d in out if not d.get("done")]
+        return out
+
+    def __call__(self, method, url, auth, body=None, params=None):
+        self.calls.append((method, url, body, params))
+        assert auth == (self.CREDS["sync_user"], self.CREDS["sync_password"])
+        if url.endswith("/_find"):
+            if self.find_fails:
+                return None
+            hits = self.matching(body)
+            start = int(body.get("bookmark") or 0)
+            page = hits[start:start + body["limit"]]
+            return {"docs": page, "bookmark": str(start + len(page))}
+        if url.endswith("/_all_docs"):
+            after = params.get("startkey_docid")
+            ordered = sorted(self.docs, key=lambda d: d["_id"])
+            if after:
+                ordered = [d for d in ordered if d["_id"] >= after]
+            rows = [{"id": d["_id"], "doc": d} for d in ordered[:params["limit"]]]
+            return {"rows": rows}
+        raise AssertionError(f"unexpected sync call {method} {url}")
+
+
 class SearchIncludesBacklog(unittest.TestCase):
     def setUp(self):
         self.backlog = task("bl1", "Jon-Luke battle.net: tell Nick")
@@ -470,6 +540,109 @@ class SearchIncludesBacklog(unittest.TestCase):
         _, out = self.search("battle")
         self.assertEqual(out.count("battle.net"), 1)
         self.assertEqual(self.fake.posts, [])
+
+
+YESTERDAY = (marvin.datetime.now().date() - marvin.timedelta(days=1)).isoformat()
+
+
+class SearchPastTheApiCap(unittest.TestCase):
+    """The 11/8 bug: three open tasks that 'marvin search' called "No tasks found".
+
+    The children endpoint returns at most CHILDREN_CAP items per parent, sorted
+    by _id ascending, with no way to page past them, so every root task whose id
+    sorts above the cut is unreachable through the API. All three missing tasks
+    had such ids; a task with a low id ("Trello", 09be...) was found all along.
+    """
+
+    FILLER = [task(f"0{n:031x}", f"filler {n}") for n in range(marvin.CHILDREN_CAP)]
+    HIDDEN = [
+        task("b72ef38a" + "0" * 24, "Jon-Luke battle.net: tell Nick"),
+        task("d22b8428" + "0" * 24, "Mythos company template audit"),
+        task("e0000000" + "0" * 24, "Send Tom the site-leads skill (Tom meeting 11/3)"),
+    ]
+
+    def setUp(self):
+        # The API serves only what fits under the cap: the filler, never HIDDEN.
+        self.fake = FakeMarvin(children={"unassigned": list(self.FILLER)})
+        patcher = mock.patch.object(marvin, "api_request", self.fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def search(self, *words, **kw):
+        return run(marvin.cmd_search, query=list(words), all=kw.get("all", False))
+
+    def test_api_route_reports_the_cap_instead_of_claiming_nothing_matched(self):
+        for term in ("battle", "mythos", "site-leads"):
+            with self.subTest(term):
+                code, out = self.search(term)
+                self.assertIsNone(code, out)
+                self.assertIn("No tasks found", out)
+                self.assertIn(f"{marvin.CHILDREN_CAP}-item API cap hit", out)
+                self.assertIn("(uncategorized)", out)
+                self.assertIn("marvin setup", out)
+
+    def test_no_cap_warning_when_every_list_fits(self):
+        self.fake.children = {"unassigned": list(self.FILLER[:5])}
+        _, out = self.search("filler 1")
+        self.assertNotIn("API cap", out)
+
+    def test_sync_route_finds_every_hidden_task(self):
+        FakeSyncDB(self.FILLER + self.HIDDEN).install(self)
+        for term, title in (
+            ("battle", "battle.net"),
+            ("mythos", "Mythos company template audit"),
+            ("site-leads", "Send Tom the site-leads skill"),
+        ):
+            with self.subTest(term):
+                code, out = self.search(term)
+                self.assertIsNone(code, out)
+                self.assertIn(title, out)
+                self.assertNotIn("API cap", out)
+        self.assertEqual(self.fake.posts, [])
+
+    def test_sync_route_pages_until_the_database_is_exhausted(self):
+        many = [task(f"9{n:031x}", f"bulk {n} battle") for n in range(marvin.SYNC_PAGE * 2 + 7)]
+        db = FakeSyncDB(many).install(self)
+        _, out = self.search("bulk 1200 battle")
+        self.assertIn("bulk 1200 battle", out)
+        self.assertEqual(len(db.calls), 3)
+        self.assertEqual([c[2]["bookmark"] for c in db.calls[1:]],
+                         [str(marvin.SYNC_PAGE), str(marvin.SYNC_PAGE * 2)])
+
+    def test_sync_route_leaves_done_tasks_out_unless_all_is_passed(self):
+        db = FakeSyncDB(self.HIDDEN + [task("f" * 32, "Old battle task", done=True)])
+        db.install(self)
+        _, out = self.search("battle")
+        self.assertNotIn("Old battle task", out)
+        _, out = self.search("battle", all=True)
+        self.assertIn("Old battle task", out)
+
+    def test_falls_back_to_all_docs_when_find_is_unavailable(self):
+        db = FakeSyncDB(self.HIDDEN + [{"_id": "z1", "db": "TimeData", "title": "mythos noise"}],
+                        find_fails=True).install(self)
+        _, out = self.search("mythos")
+        self.assertIn("Mythos company template audit", out)
+        self.assertNotIn("mythos noise", out)  # only Tasks and Categories count
+        self.assertTrue(any(c[1].endswith("/_all_docs") for c in db.calls))
+
+    def test_search_covers_tasks_left_on_a_past_day(self):
+        stale = task("c" * 32, "battle.net follow-up", day=YESTERDAY)
+        self.fake.upcoming = {YESTERDAY: [stale]}
+        _, out = self.search("battle.net")
+        self.assertIn("battle.net follow-up", out)
+        # Outside every pool resolve_task searches by prefix, so the full id shows.
+        self.assertIn("c" * 32, out)
+
+    def test_backlog_uses_the_sync_route_and_groups_by_category(self):
+        filed = task("a" * 32, "Mythos audit", parentId="cat1")
+        self.fake.categories = [{"_id": "cat1", "title": "Security"}]
+        FakeSyncDB(self.HIDDEN + [filed]).install(self)
+        code, out = run(marvin.cmd_backlog, uncategorized=False, subtasks=False)
+        self.assertIsNone(code, out)
+        self.assertIn("4 open task(s)", out)
+        self.assertIn("# Security  (1)", out)
+        self.assertIn("Mythos audit", out)
+        self.assertNotIn("API cap", out)
 
 
 if __name__ == "__main__":
