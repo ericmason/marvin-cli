@@ -39,6 +39,7 @@ Commands:
 """
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -172,11 +173,17 @@ def load_config():
 
 
 def save_config(config):
-    """Save configuration to file."""
+    """Save configuration to file, readable only by its owner.
+
+    The file holds API tokens and the sync password, so it is created at 0o600
+    rather than created world-readable and tightened afterwards. os.open applies
+    that mode only to a new file, so an existing one is also chmodded.
+    """
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
+    fd = os.open(CONFIG_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(config, f, indent=2)
-    os.chmod(CONFIG_FILE, 0o600)  # Secure the file
+    os.chmod(CONFIG_FILE, 0o600)
 
 
 def get_token(full_access=False):
@@ -251,6 +258,8 @@ SYNC_DBS = ["Tasks", "Categories"]
 _sync_warned = False
 # One command run reads the database at most once per done-ness, since two
 # helpers in the same run (resolution and a listing) both want everything.
+# A failed read is cached too, so one unreachable database is not retried all
+# over again by the next helper in the same run.
 _sync_cache = {}
 
 
@@ -262,16 +271,28 @@ def sync_credentials():
     busy root bucket hides tasks from every list built on it. Reading the sync
     database directly is the only complete route, and it is the one Marvin's own
     docs point to (https://github.com/amazingmarvin/MarvinAPI/wiki/Database-Access).
+
+    These credentials read and write almost the whole account, so plain HTTP is
+    refused: it would put the password on the wire.
     """
     config = load_config()
     creds = {key: config.get(key) for key in SYNC_KEYS}
-    return creds if all(creds.values()) else None
+    if not all(creds.values()):
+        return None
+    if not str(creds["sync_server"]).lower().startswith("https://"):
+        sync_warn("sync_server is not an https:// URL, so the sync password "
+                  "would travel in the clear. Fix it with 'marvin setup'.")
+        return None
+    return creds
 
 
 def sync_http(method, url, auth, body=None, params=None):
     """One request to the sync database. Returns parsed JSON, or None on failure.
 
     The single HTTP seam for sync reads, so tests can stand in for the database.
+    Retries a rate limit, a server error, and a connection failure, since those
+    can pass. A 401, 403, or 404 is an answer, not a hiccup, so it returns at
+    once rather than hammering the database four times with bad credentials.
     """
     for attempt in range(4):
         try:
@@ -282,18 +303,37 @@ def sync_http(method, url, auth, body=None, params=None):
                 )
             else:
                 resp = requests.get(url, auth=auth, params=params, timeout=60)
-            if resp.status_code == 429 or resp.status_code >= 500:
-                if attempt < 3:
-                    time.sleep(2 * (attempt + 1))
-                    continue
-            resp.raise_for_status()
-            return resp.json()
-        except (requests.exceptions.RequestException, json.JSONDecodeError):
+        except requests.exceptions.RequestException as e:
             if attempt < 3:
                 time.sleep(2 * (attempt + 1))
                 continue
+            sync_note_error(str(e))
+            return None
+        status = resp.status_code
+        if status == 429 or status >= 500:
+            if attempt < 3:
+                time.sleep(2 * (attempt + 1))
+                continue
+            sync_note_error(f"HTTP {status}")
+            return None
+        if status >= 400:
+            sync_note_error(f"HTTP {status}")
+            return None
+        try:
+            return resp.json()
+        except json.JSONDecodeError:
+            sync_note_error("the response was not JSON")
             return None
     return None
+
+
+_sync_error = None
+
+
+def sync_note_error(reason):
+    """Remember why a sync read failed, for the warning the user sees."""
+    global _sync_error
+    _sync_error = reason
 
 
 def sync_warn(reason):
@@ -312,6 +352,10 @@ def sync_all_items(include_done=False):
 
     No 200-item cap and no per-category sweep: one paged query covers the whole
     account, including tasks the API's children endpoint cannot reach.
+
+    Done-ness is filtered here rather than in the selector: in Mango a missing
+    field fails every operator, so {"done": {"$ne": True}} would drop every task
+    that has no done field at all.
     """
     creds = sync_credentials()
     if not creds:
@@ -321,52 +365,88 @@ def sync_all_items(include_done=False):
     auth = (creds["sync_user"], creds["sync_password"])
     base = f"{creds['sync_server'].rstrip('/')}/{creds['sync_database'].strip('/')}"
 
-    selector = {"db": {"$in": SYNC_DBS}}
-    if not include_done:
-        selector["done"] = {"$ne": True}
+    docs = sync_find(base, auth)
+    if docs is None:
+        docs = sync_all_docs(base, auth)
+    if docs is None:
+        sync_warn(f"Could not read the sync database ({_sync_error or 'unknown error'}).")
+        _sync_cache[include_done] = None
+        return None
 
     items = []
+    seen = set()
+    for doc in docs:
+        doc_id = doc.get("_id")
+        if doc_id in seen or doc.get("db") not in SYNC_DBS:
+            continue
+        if not include_done and doc.get("done"):
+            continue
+        seen.add(doc_id)
+        items.append(doc)
+    _sync_cache[include_done] = items
+    return items
+
+
+def sync_overrun(route):
+    """Say that paging gave up, so a short answer is never mistaken for all of it."""
+    print(f"Warning: stopped reading the sync database after {SYNC_MAX_PAGES} "
+          f"{route} pages; results may be incomplete.", file=sys.stderr)
+
+
+def sync_find(base, auth):
+    """Every Tasks/Categories document via _find, or None if _find is unavailable.
+
+    Pages by bookmark until a page comes back empty or the bookmark stops
+    advancing. A short page is not the end: CouchDB may serve fewer rows than
+    the requested limit.
+    """
+    docs = []
     bookmark = None
+    seen_bookmarks = set()
     for _ in range(SYNC_MAX_PAGES):
-        body = {"selector": selector, "limit": SYNC_PAGE}
+        body = {"selector": {"db": {"$in": SYNC_DBS}}, "limit": SYNC_PAGE}
         if bookmark:
             body["bookmark"] = bookmark
         data = sync_http("POST", f"{base}/_find", auth, body=body)
         if not isinstance(data, dict) or "docs" not in data:
-            items = sync_all_docs(base, auth, include_done)
-            break
-        docs = data["docs"]
-        items.extend(docs)
+            return None
+        page = data["docs"]
+        docs.extend(page)
         bookmark = data.get("bookmark")
-        if len(docs) < SYNC_PAGE or not bookmark:
-            break
-    if items is not None:
-        _sync_cache[include_done] = items
-    return items
+        if not page or not bookmark or bookmark in seen_bookmarks:
+            return docs
+        seen_bookmarks.add(bookmark)
+    sync_overrun("_find")
+    return docs
 
 
-def sync_all_docs(base, auth, include_done=False):
-    """_all_docs fallback for a sync database whose _find is unavailable."""
-    items = []
-    start = None
+def sync_all_docs(base, auth):
+    """_all_docs fallback for a sync database whose _find is unavailable.
+
+    Pages by startkey, because CouchDB ignores startkey_docid unless startkey is
+    set, and skips the row the key repeats. Stops on an empty page or a key that
+    stops advancing, never on a short page.
+    """
+    docs = []
+    startkey = None
     for _ in range(SYNC_MAX_PAGES):
-        params = {"include_docs": "true", "limit": SYNC_PAGE + 1}
-        if start:
-            params["startkey_docid"] = start
+        params = {"include_docs": "true", "limit": SYNC_PAGE}
+        if startkey is not None:
+            params["startkey"] = json.dumps(startkey)
+            params["skip"] = 1
         data = sync_http("GET", f"{base}/_all_docs", auth, params=params)
         if not isinstance(data, dict) or "rows" not in data:
-            sync_warn("Could not read the sync database.")
             return None
         rows = data["rows"]
-        page = [r.get("doc") or {} for r in rows[:SYNC_PAGE]]
-        items.extend(
-            d for d in page
-            if d.get("db") in SYNC_DBS and (include_done or not d.get("done"))
-        )
-        if len(rows) <= SYNC_PAGE:
-            return items
-        start = rows[SYNC_PAGE].get("id")
-    return items
+        if not rows:
+            return docs
+        docs.extend(row.get("doc") or {} for row in rows)
+        last = rows[-1].get("id")
+        if not last or last == startkey:
+            return docs
+        startkey = last
+    sync_overrun("_all_docs")
+    return docs
 
 
 def cmd_setup(args):
@@ -389,14 +469,23 @@ def cmd_setup(args):
     print("\nSync database credentials (same page, under 'API strategy').")
     print("Without them, search and backlog see at most 200 items per list.")
     for key, prompt in (
-        ("sync_server", "syncServer (e.g. https://...)"),
+        ("sync_server", "syncServer (https://...)"),
         ("sync_database", "syncDatabase"),
         ("sync_user", "syncUser"),
-        ("sync_password", "syncPassword"),
     ):
         value = input(f"{prompt}: ").strip()
-        if value:
-            config[key] = value
+        if not value:
+            continue
+        if key == "sync_server" and not value.lower().startswith("https://"):
+            # The password rides on every request, so http is not an option.
+            print("  Not saved: syncServer must start with https://")
+            continue
+        config[key] = value
+
+    # Never echoed, and never shown back in any listing.
+    password = getpass.getpass("syncPassword (not shown): ").strip()
+    if password:
+        config["sync_password"] = password
 
     save_config(config)
     print(f"\nConfig saved to {CONFIG_FILE}")
@@ -1583,15 +1672,16 @@ def past_task_pool(days=SEARCH_PAST_DAYS):
 
 
 def search_pool(include_done=False):
-    """(items, capped): every open task a title search can reach.
+    """(items, capped, complete): every open task a title search can reach.
 
-    With sync credentials, that is every task in the account. Without them it is
-    the day lists plus the children sweep, and capped names the lists that hit
-    the 200-item cap, where the results are knowably incomplete.
+    complete is True only when the sync read actually succeeded, which is the
+    one route that returns every task in the account. Otherwise this is the day
+    lists plus the children sweep, and capped names the lists that hit the
+    200-item cap, where the results are knowably incomplete.
     """
     sync_items = sync_all_items(include_done=include_done)
     if sync_items is not None:
-        return sync_items, []
+        return sync_items, [], True
 
     swept, capped = children_sweep(include_done=include_done)
     sources = [
@@ -1609,7 +1699,7 @@ def search_pool(include_done=False):
     items = gather_items(*sources)
     if not include_done:
         items = [it for it in items if not it.get("done")]
-    return items, capped
+    return items, capped, False
 
 
 def cmd_backlog(args):
@@ -1924,7 +2014,7 @@ def cmd_search(args):
         print("Error: Search query required")
         sys.exit(1)
 
-    all_items, capped = search_pool(include_done=args.all)
+    all_items, capped, complete = search_pool(include_done=args.all)
 
     # Search tasks and subtasks
     matches = []
@@ -1947,10 +2037,10 @@ def cmd_search(args):
     print("-" * 40)
 
     uids = display_ids(matches, [sub for _, sub in subtask_matches])
-    if sync_credentials() is None:
-        # Without the sync database, a hit on a past day is outside every pool
-        # resolve_task searches by prefix, so show the full id, which resolves
-        # by exact lookup.
+    if not complete:
+        # Without a successful sync read, a hit on a past day is outside every
+        # pool resolve_task searches by prefix, so show the full id, which
+        # resolves by exact lookup.
         for item in matches:
             day = item.get("day", "")
             if day and day != "unassigned" and not in_resolve_window(day):

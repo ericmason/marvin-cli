@@ -72,6 +72,10 @@ With the sync credentials configured, both commands read the sync database
 and nothing is capped. Reads are the only thing the CLI does with them. Without
 them, any command that hits the cap says so and names the list.
 
+These credentials read and write almost your whole account, so `marvin setup`
+takes the password without echoing it, stores the config at mode 600, and
+refuses a `syncServer` that isn't `https://`.
+
 ## Usage
 
 ```bash
