@@ -51,9 +51,30 @@ marvin setup
 
 - **API Token** — required for creating/updating tasks
 - **Full Access Token** — required for reading your data (today's list, due items, etc.)
+- **Sync credentials** (`syncServer`, `syncDatabase`, `syncUser`, `syncPassword`) — required for `marvin search` and `marvin backlog` to see every task
 
 Tokens are stored locally at `~/.config/marvin/config.json`. This file is never
 committed — keep it private.
+
+### Why the sync credentials matter
+
+Marvin's REST API has no endpoint that lists every task. The widest one,
+`GET /api/children?parentId=<id>`, returns at most 200 items per parent, sorted
+by `_id` ascending, and ignores `limit`, `skip`, `offset`, and `startkey` — so
+once a parent holds more than 200 open items, the rest are unreachable through
+the API. On a busy inbox that silently hides tasks from `marvin search` and
+`marvin backlog`, and `marvin search` prints "No tasks found" for a task that
+exists.
+
+With the sync credentials configured, both commands read the sync database
+(CouchDB) directly, which Marvin
+[documents](https://github.com/amazingmarvin/MarvinAPI/wiki/Database-Access),
+and nothing is capped. Reads are the only thing the CLI does with them. Without
+them, any command that hits the cap says so and names the list.
+
+These credentials read and write almost your whole account, so `marvin setup`
+takes the password without echoing it, stores the config at mode 600, and
+refuses a `syncServer` that isn't `https://`.
 
 ## Usage
 

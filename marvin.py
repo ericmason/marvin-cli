@@ -35,10 +35,11 @@ Commands:
     marvin backlog -u               # ...uncategorized root bucket only
     marvin today -S                 # ...also fetch each task's child tasks
     marvin labels                   # List labels
-    marvin setup                    # Configure API token
+    marvin setup                    # Configure API tokens and sync credentials
 """
 
 import argparse
+import getpass
 import json
 import os
 import re
@@ -172,11 +173,17 @@ def load_config():
 
 
 def save_config(config):
-    """Save configuration to file."""
+    """Save configuration to file, readable only by its owner.
+
+    The file holds API tokens and the sync password, so it is created at 0o600
+    rather than created world-readable and tightened afterwards. os.open applies
+    that mode only to a new file, so an existing one is also chmodded.
+    """
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
+    fd = os.open(CONFIG_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
         json.dump(config, f, indent=2)
-    os.chmod(CONFIG_FILE, 0o600)  # Secure the file
+    os.chmod(CONFIG_FILE, 0o600)
 
 
 def get_token(full_access=False):
@@ -241,6 +248,207 @@ def api_request(method, endpoint, data=None, full_access=False, tolerant=False, 
             sys.exit(1)
 
 
+SYNC_KEYS = ("sync_server", "sync_database", "sync_user", "sync_password")
+# Documents per request when reading the sync database. CouchDB pages with a
+# bookmark (_find) or a start key (_all_docs), so this only sets the page size.
+SYNC_PAGE = 500
+SYNC_MAX_PAGES = 400
+# Item types a task search cares about: tasks, and the projects they sit in.
+SYNC_DBS = ["Tasks", "Categories"]
+_sync_warned = False
+# One command run reads the database at most once per done-ness, since two
+# helpers in the same run (resolution and a listing) both want everything.
+# A failed read is cached too, so one unreachable database is not retried all
+# over again by the next helper in the same run.
+_sync_cache = {}
+
+
+def sync_credentials():
+    """The sync (CouchDB) credentials from config, or None if not configured.
+
+    Marvin's REST API has no endpoint that lists every task: GET /api/children
+    returns at most 200 items per parent with no way to page past them, so a
+    busy root bucket hides tasks from every list built on it. Reading the sync
+    database directly is the only complete route, and it is the one Marvin's own
+    docs point to (https://github.com/amazingmarvin/MarvinAPI/wiki/Database-Access).
+
+    These credentials read and write almost the whole account, so plain HTTP is
+    refused: it would put the password on the wire.
+    """
+    config = load_config()
+    creds = {key: config.get(key) for key in SYNC_KEYS}
+    if not all(creds.values()):
+        return None
+    if not str(creds["sync_server"]).lower().startswith("https://"):
+        sync_warn("sync_server is not an https:// URL, so the sync password "
+                  "would travel in the clear. Fix it with 'marvin setup'.")
+        return None
+    return creds
+
+
+def sync_http(method, url, auth, body=None, params=None):
+    """One request to the sync database. Returns parsed JSON, or None on failure.
+
+    The single HTTP seam for sync reads, so tests can stand in for the database.
+    Retries a rate limit, a server error, and a connection failure, since those
+    can pass. A 401, 403, or 404 is an answer, not a hiccup, so it returns at
+    once rather than hammering the database four times with bad credentials.
+    """
+    for attempt in range(4):
+        try:
+            if method == "POST":
+                resp = requests.post(
+                    url, auth=auth, json=body, params=params,
+                    headers={"Content-Type": "application/json"}, timeout=60,
+                )
+            else:
+                resp = requests.get(url, auth=auth, params=params, timeout=60)
+        except requests.exceptions.RequestException as e:
+            if attempt < 3:
+                time.sleep(2 * (attempt + 1))
+                continue
+            sync_note_error(str(e))
+            return None
+        status = resp.status_code
+        if status == 429 or status >= 500:
+            if attempt < 3:
+                time.sleep(2 * (attempt + 1))
+                continue
+            sync_note_error(f"HTTP {status}")
+            return None
+        if status >= 400:
+            sync_note_error(f"HTTP {status}")
+            return None
+        try:
+            return resp.json()
+        except json.JSONDecodeError:
+            sync_note_error("the response was not JSON")
+            return None
+    return None
+
+
+_sync_error = None
+
+
+def sync_note_error(reason):
+    """Remember why a sync read failed, for the warning the user sees."""
+    global _sync_error
+    _sync_error = reason
+
+
+def sync_warn(reason):
+    """Explain once per run that the complete route is unavailable."""
+    global _sync_warned
+    if _sync_warned:
+        return
+    _sync_warned = True
+    print(f"  ⚠ {reason}")
+    print("    Falling back to the API, which returns at most 200 items per list, "
+          "so tasks may be missing.")
+
+
+def sync_all_items(include_done=False):
+    """Every task and project in the sync database, or None when unavailable.
+
+    No 200-item cap and no per-category sweep: one paged query covers the whole
+    account, including tasks the API's children endpoint cannot reach.
+
+    Done-ness is filtered here rather than in the selector: in Mango a missing
+    field fails every operator, so {"done": {"$ne": True}} would drop every task
+    that has no done field at all.
+    """
+    creds = sync_credentials()
+    if not creds:
+        return None
+    if include_done in _sync_cache:
+        return _sync_cache[include_done]
+    auth = (creds["sync_user"], creds["sync_password"])
+    base = f"{creds['sync_server'].rstrip('/')}/{creds['sync_database'].strip('/')}"
+
+    docs = sync_find(base, auth)
+    if docs is None:
+        docs = sync_all_docs(base, auth)
+    if docs is None:
+        sync_warn(f"Could not read the sync database ({_sync_error or 'unknown error'}).")
+        _sync_cache[include_done] = None
+        return None
+
+    items = []
+    seen = set()
+    for doc in docs:
+        doc_id = doc.get("_id")
+        if doc_id in seen or doc.get("db") not in SYNC_DBS:
+            continue
+        if not include_done and doc.get("done"):
+            continue
+        seen.add(doc_id)
+        items.append(doc)
+    _sync_cache[include_done] = items
+    return items
+
+
+def sync_overrun(route):
+    """Say that paging gave up, so a short answer is never mistaken for all of it."""
+    print(f"Warning: stopped reading the sync database after {SYNC_MAX_PAGES} "
+          f"{route} pages; results may be incomplete.", file=sys.stderr)
+
+
+def sync_find(base, auth):
+    """Every Tasks/Categories document via _find, or None if _find is unavailable.
+
+    Pages by bookmark until a page comes back empty or the bookmark stops
+    advancing. A short page is not the end: CouchDB may serve fewer rows than
+    the requested limit.
+    """
+    docs = []
+    bookmark = None
+    seen_bookmarks = set()
+    for _ in range(SYNC_MAX_PAGES):
+        body = {"selector": {"db": {"$in": SYNC_DBS}}, "limit": SYNC_PAGE}
+        if bookmark:
+            body["bookmark"] = bookmark
+        data = sync_http("POST", f"{base}/_find", auth, body=body)
+        if not isinstance(data, dict) or "docs" not in data:
+            return None
+        page = data["docs"]
+        docs.extend(page)
+        bookmark = data.get("bookmark")
+        if not page or not bookmark or bookmark in seen_bookmarks:
+            return docs
+        seen_bookmarks.add(bookmark)
+    sync_overrun("_find")
+    return docs
+
+
+def sync_all_docs(base, auth):
+    """_all_docs fallback for a sync database whose _find is unavailable.
+
+    Pages by startkey, because CouchDB ignores startkey_docid unless startkey is
+    set, and skips the row the key repeats. Stops on an empty page or a key that
+    stops advancing, never on a short page.
+    """
+    docs = []
+    startkey = None
+    for _ in range(SYNC_MAX_PAGES):
+        params = {"include_docs": "true", "limit": SYNC_PAGE}
+        if startkey is not None:
+            params["startkey"] = json.dumps(startkey)
+            params["skip"] = 1
+        data = sync_http("GET", f"{base}/_all_docs", auth, params=params)
+        if not isinstance(data, dict) or "rows" not in data:
+            return None
+        rows = data["rows"]
+        if not rows:
+            return docs
+        docs.extend(row.get("doc") or {} for row in rows)
+        last = rows[-1].get("id")
+        if not last or last == startkey:
+            return docs
+        startkey = last
+    sync_overrun("_all_docs")
+    return docs
+
+
 def cmd_setup(args):
     """Set up API tokens."""
     print("Amazing Marvin API Setup")
@@ -258,8 +466,37 @@ def cmd_setup(args):
     if full_token:
         config["full_access_token"] = full_token
 
+    print("\nSync database credentials (same page, under 'API strategy').")
+    print("Without them, search and backlog see at most 200 items per list.")
+    for key, prompt in (
+        ("sync_server", "syncServer (https://...)"),
+        ("sync_database", "syncDatabase"),
+        ("sync_user", "syncUser"),
+    ):
+        value = input(f"{prompt}: ").strip()
+        if not value:
+            continue
+        if key == "sync_server" and not value.lower().startswith("https://"):
+            # The password rides on every request, so http is not an option.
+            print("  Not saved: syncServer must start with https://")
+            continue
+        config[key] = value
+
+    # Never echoed, and never shown back in any listing.
+    password = getpass.getpass("syncPassword (not shown): ").strip()
+    if password:
+        config["sync_password"] = password
+
     save_config(config)
     print(f"\nConfig saved to {CONFIG_FILE}")
+
+    if all(config.get(k) for k in SYNC_KEYS):
+        print("\nTesting the sync database...")
+        items = sync_all_items()
+        if items is None:
+            print("✗ Could not read the sync database")
+        else:
+            print(f"✓ Sync database reachable — {len(items)} open task(s)")
 
     # Test the connection
     if config.get("api_token"):
@@ -501,6 +738,11 @@ def day_task_pool(include_done=False, done_date=None):
 
 
 UPCOMING_DAYS = 14
+# Days back that a search covers, for tasks left on a past day.
+SEARCH_PAST_DAYS = 14
+# Items the children endpoint returns per parent, at most. Undocumented, and
+# there is no way to page past it: see children_sweep.
+CHILDREN_CAP = 200
 # Concurrent requests when sweeping days or categories; api_request backs off
 # on 429, so this only needs to stay modest.
 POOL_WORKERS = 4
@@ -556,7 +798,14 @@ def deep_task_pool():
 
     Reaches unscheduled tasks, which no day-based list returns. Costs one request
     per category, so a full id skips it. Exits if any category fails to load.
+
+    With sync credentials configured, the sync database replaces the sweep, which
+    also reaches tasks past the API's 200-item-per-parent cap.
     """
+    sync_items = sync_all_items()
+    if sync_items is not None:
+        return sync_items
+
     cats = api_request("GET", "categories", full_access=True) or []
     parent_ids = ["unassigned"] + [c["_id"] for c in cats]
 
@@ -1333,8 +1582,7 @@ def cmd_category(args):
         for kid in nested.get(it.get("_id"), []):
             kdone, kttl, ktime, ksid = format_task(kid, uids)
             print(f"      {kdone} {kttl}{ktime}{meta_for(kid)}  ({ksid})")
-    if len(items) >= 200:
-        print("  … (200-item API cap hit — list may be truncated)")
+    warn_capped([title] if len(items) >= CHILDREN_CAP else [])
 
 
 def gather_backlog(uncategorized_only=False):
@@ -1344,17 +1592,33 @@ def gather_backlog(uncategorized_only=False):
     'unassigned' bucket if uncategorized), so this walks the root plus every
     category/project. Returns (groups, truncated): groups is [(label, [tasks])],
     truncated lists parents that hit the 200-item API cap. Read-only.
+
+    With sync credentials configured, one query to the sync database replaces the
+    sweep and nothing is capped.
     """
     cats = api_request("GET", "categories", full_access=True) or []
     parents = [("(uncategorized)", "unassigned")]
     if not uncategorized_only:
         parents += [(c.get("title", "Untitled"), c["_id"]) for c in cats]
 
+    sync_items = sync_all_items()
+    if sync_items is not None:
+        by_parent = {}
+        for it in sync_items:
+            if it.get("db") != "Tasks" or it.get("done"):
+                continue
+            if it.get("day", "unassigned") != "unassigned":
+                continue
+            # A task at the top level sits in the root bucket, 'unassigned'.
+            by_parent.setdefault(it.get("parentId") or "unassigned", []).append(it)
+        groups = [(label, by_parent[pid]) for label, pid in parents if by_parent.get(pid)]
+        return groups, []
+
     groups = []       # (label, [tasks])
     truncated = []    # parents that hit the 200-item cap
     for label, pid in parents:
         items = api_request("GET", "children", {"parentId": pid}, full_access=True, tolerant=True) or []
-        if len(items) >= 200:
+        if len(items) >= CHILDREN_CAP:
             truncated.append(label)
         open_unsched = [
             it for it in items
@@ -1363,6 +1627,79 @@ def gather_backlog(uncategorized_only=False):
         if open_unsched:
             groups.append((label, open_unsched))
     return groups, truncated
+
+
+def children_sweep(include_done=False):
+    """(items, capped): every item the children endpoint returns, root plus each
+    category/project.
+
+    capped names the parents whose response hit the API's 200-item cap, where
+    items past the cap are unreachable: the endpoint returns the first 200 by
+    _id ascending and ignores limit, skip, offset, and startkey, so nothing
+    built on it can see the rest.
+    """
+    cats = api_request("GET", "categories", full_access=True) or []
+    parents = [("(uncategorized)", "unassigned")]
+    parents += [(c.get("title", "Untitled"), c["_id"]) for c in cats]
+
+    items = []
+    capped = []
+    for label, pid in parents:
+        got = api_request(
+            "GET", "children", {"parentId": pid}, full_access=True, tolerant=True
+        ) or []
+        if len(got) >= CHILDREN_CAP:
+            capped.append(label)
+        items.extend(got if include_done else [it for it in got if not it.get("done")])
+    return items, capped
+
+
+def past_task_pool(days=SEARCH_PAST_DAYS):
+    """Tasks still sitting on each of the last `days` days.
+
+    A task left on a past day is in no current list, and is reachable through
+    the children endpoint only while its parent stays under the 200-item cap.
+    """
+    today = datetime.now().date()
+    dates = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(1, days + 1)]
+
+    def fetch_day(date_str):
+        return api_request(
+            "GET", "todayItems", {"date": date_str}, full_access=True, tolerant=True
+        )
+
+    return fetch_all_or_exit(fetch_day, dates, "the day list for")
+
+
+def search_pool(include_done=False):
+    """(items, capped, complete): every open task a title search can reach.
+
+    complete is True only when the sync read actually succeeded, which is the
+    one route that returns every task in the account. Otherwise this is the day
+    lists plus the children sweep, and capped names the lists that hit the
+    200-item cap, where the results are knowably incomplete.
+    """
+    sync_items = sync_all_items(include_done=include_done)
+    if sync_items is not None:
+        return sync_items, [], True
+
+    swept, capped = children_sweep(include_done=include_done)
+    sources = [
+        api_request("GET", "todayItems", full_access=True) or [],
+        api_request("GET", "dueItems", full_access=True) or [],
+        upcoming_task_pool(),
+        past_task_pool(),
+        swept,
+    ]
+    if include_done:
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        sources.append(
+            api_request("GET", "doneItems", {"date": date_str}, full_access=True) or []
+        )
+    items = gather_items(*sources)
+    if not include_done:
+        items = [it for it in items if not it.get("done")]
+    return items, capped, False
 
 
 def cmd_backlog(args):
@@ -1396,8 +1733,7 @@ def cmd_backlog(args):
                 kdue = kid.get("dueDate", "")
                 print(f"      {kdone} {kttl}{ktime}"
                       f"{f'  due:{kdue}' if kdue else ''}  ({ksid})")
-    if truncated:
-        print(f"\n  ⚠ 200-item API cap hit for: {', '.join(truncated)} — some tasks may be hidden.")
+    warn_capped(truncated)
 
 
 def cmd_due(args):
@@ -1678,40 +2014,37 @@ def cmd_search(args):
         print("Error: Search query required")
         sys.exit(1)
 
-    today_items = api_request("GET", "todayItems", full_access=True) or []
-    due_items = api_request("GET", "dueItems", full_access=True) or []
-    backlog_groups, _ = gather_backlog()
-    backlog_items = [it for _, tasks in backlog_groups for it in tasks]
-    sources = [today_items, due_items, upcoming_task_pool(), backlog_items]
-
-    today = datetime.now().date()
-    if args.all:
-        date_str = today.strftime("%Y-%m-%d")
-        done_items = api_request("GET", "doneItems", {"date": date_str}, full_access=True) or []
-        sources.append(done_items)
-
-    all_items = gather_items(*sources)
+    all_items, capped, complete = search_pool(include_done=args.all)
 
     # Search tasks and subtasks
     matches = []
     subtask_matches = []  # (parent_title, subtask_dict)
 
     for item in all_items:
-        if query in item.get("title", "").lower():
+        if query in (item.get("title") or "").lower():
             matches.append(item)
         # Search embedded subtasks
-        for sub in item.get("subtasks", {}).values():
-            if query in sub.get("title", "").lower():
+        for sub in (item.get("subtasks") or {}).values():
+            if query in (sub.get("title") or "").lower():
                 subtask_matches.append((item.get("title", "Untitled"), sub))
 
     if not matches and not subtask_matches:
         print(f"No tasks found matching '{query}'")
+        warn_capped(capped)
         return
 
     print(f"Tasks matching '{query}':")
     print("-" * 40)
 
     uids = display_ids(matches, [sub for _, sub in subtask_matches])
+    if not complete:
+        # Without a successful sync read, a hit on a past day is outside every
+        # pool resolve_task searches by prefix, so show the full id, which
+        # resolves by exact lookup.
+        for item in matches:
+            day = item.get("day", "")
+            if day and day != "unassigned" and not in_resolve_window(day):
+                uids[item.get("_id", "")] = item.get("_id", "")
     for item in matches:
         done, title, time_str, sid = format_task(item, uids)
         scheduled = item.get("day", "")
@@ -1725,6 +2058,24 @@ def cmd_search(args):
         sub_title = sub.get("title", "Untitled")
         sub_sid = uids.get(sub.get("_id", "")) or short_id(sub.get("_id", ""))
         print(f"      {sub_done} {sub_title}  ({sub_sid})  [in: {parent_title}]")
+
+    warn_capped(capped)
+
+
+def warn_capped(capped):
+    """Say so when a list hit the API cap, because then "not found" is not an answer.
+
+    The children endpoint returns at most CHILDREN_CAP items per parent and has
+    no pagination, so tasks past the cap are invisible to the API entirely. Sync
+    credentials are the only way to read them.
+    """
+    if not capped:
+        return
+    print(f"\n  ⚠ {CHILDREN_CAP}-item API cap hit for: {', '.join(capped)}.")
+    print("    Tasks past the cap cannot be read through the API at all, so this "
+          "search could not see them.")
+    print("    Run 'marvin setup' and add the sync credentials from "
+          "https://app.amazingmarvin.com/pre?api to search everything.")
 
 
 def cmd_list(args):

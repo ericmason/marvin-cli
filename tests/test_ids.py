@@ -6,6 +6,7 @@ Run with: python3 -m unittest discover -s tests
 import argparse
 import contextlib
 import io
+import json
 import os
 import sys
 import unittest
@@ -440,6 +441,106 @@ class DisplayIds(unittest.TestCase):
         self.assertEqual(marvin.short_id("abcdef1234567890"), "abcdef12")
 
 
+REAL_SYNC_CREDENTIALS = marvin.sync_credentials
+_no_sync = mock.patch.object(marvin, "sync_credentials", lambda: None)
+
+
+def setUpModule():
+    """Default every test to no sync credentials, whatever this machine's config
+    holds, so no test can reach a real sync database. The tests that exercise the
+    sync route patch it again themselves."""
+    _no_sync.start()
+
+
+def tearDownModule():
+    _no_sync.stop()
+
+
+class FakeSyncDB:
+    """Stands in for the sync database at marvin's single HTTP seam.
+
+    Behaves like CouchDB where that matters to the caller:
+
+    - a Mango operator on a missing field never matches, so {"$ne": True} on a
+      doc with no done field returns nothing;
+    - _all_docs ignores startkey_docid unless startkey is set;
+    - page_size caps rows per page, which a server may do below the requested
+      limit, so a short page does not mean the end of the data.
+
+    find_fails=True makes _find unavailable; status fails every request with
+    that HTTP status.
+    """
+
+    CREDS = {
+        "sync_server": "https://sync.example.com",
+        "sync_database": "db-eric",
+        "sync_user": "eric",
+        "sync_password": "secret",
+    }
+
+    def __init__(self, docs, find_fails=False, page_size=None, status=None):
+        self.docs = list(docs)
+        self.find_fails = find_fails
+        self.page_size = page_size
+        self.status = status
+        self.calls = []
+
+    def install(self, testcase):
+        for name, value in (("sync_credentials", lambda: dict(self.CREDS)),
+                            ("sync_http", self)):
+            patcher = mock.patch.object(marvin, name, value)
+            patcher.start()
+            testcase.addCleanup(patcher.stop)
+        # marvin caches one read per command run; each test is its own run.
+        marvin._sync_cache.clear()
+        testcase.addCleanup(marvin._sync_cache.clear)
+        marvin._sync_warned = False
+        testcase.addCleanup(setattr, marvin, "_sync_warned", False)
+        return self
+
+    def matching(self, body):
+        """The docs a Mango selector of the shape marvin sends would return."""
+        out = list(self.docs)
+        for field, condition in body["selector"].items():
+            if "$in" in condition:
+                out = [d for d in out if d.get(field) in condition["$in"]]
+            elif "$ne" in condition:
+                # A missing field matches no operator, $exists aside.
+                out = [d for d in out
+                       if field in d and d.get(field) != condition["$ne"]]
+            else:
+                raise AssertionError(f"unsupported condition {condition}")
+        return out
+
+    def page(self, rows, limit):
+        return rows[:min(limit, self.page_size or limit)]
+
+    def __call__(self, method, url, auth, body=None, params=None):
+        self.calls.append((method, url, body, params))
+        assert auth == (self.CREDS["sync_user"], self.CREDS["sync_password"])
+        if self.status:
+            marvin.sync_note_error(f"HTTP {self.status}")
+            return None
+        if url.endswith("/_find"):
+            if self.find_fails:
+                marvin.sync_note_error("HTTP 404")
+                return None
+            hits = self.matching(body)
+            start = int(body.get("bookmark") or 0)
+            page = self.page(hits[start:], body["limit"])
+            return {"docs": page, "bookmark": str(start + len(page))}
+        if url.endswith("/_all_docs"):
+            ordered = sorted(self.docs, key=lambda d: d["_id"])
+            startkey = params.get("startkey")
+            if startkey is not None:
+                ordered = [d for d in ordered if d["_id"] >= json.loads(startkey)]
+                ordered = ordered[params.get("skip", 0):]
+            rows = [{"id": d["_id"], "doc": d}
+                    for d in self.page(ordered, params["limit"])]
+            return {"rows": rows}
+        raise AssertionError(f"unexpected sync call {method} {url}")
+
+
 class SearchIncludesBacklog(unittest.TestCase):
     def setUp(self):
         self.backlog = task("bl1", "Jon-Luke battle.net: tell Nick")
@@ -470,6 +571,244 @@ class SearchIncludesBacklog(unittest.TestCase):
         _, out = self.search("battle")
         self.assertEqual(out.count("battle.net"), 1)
         self.assertEqual(self.fake.posts, [])
+
+
+YESTERDAY = (marvin.datetime.now().date() - marvin.timedelta(days=1)).isoformat()
+
+
+class SearchPastTheApiCap(unittest.TestCase):
+    """The 11/8 bug: three open tasks that 'marvin search' called "No tasks found".
+
+    The children endpoint returns at most CHILDREN_CAP items per parent, sorted
+    by _id ascending, with no way to page past them, so every root task whose id
+    sorts above the cut is unreachable through the API. All three missing tasks
+    had such ids; a task with a low id ("Trello", 09be...) was found all along.
+    """
+
+    FILLER = [task(f"0{n:031x}", f"filler {n}") for n in range(marvin.CHILDREN_CAP)]
+    HIDDEN = [
+        task("b72ef38a" + "0" * 24, "Jon-Luke battle.net: tell Nick"),
+        task("d22b8428" + "0" * 24, "Mythos company template audit"),
+        task("e0000000" + "0" * 24, "Send Tom the site-leads skill (Tom meeting 11/3)"),
+    ]
+
+    def setUp(self):
+        # The API serves only what fits under the cap: the filler, never HIDDEN.
+        self.fake = FakeMarvin(children={"unassigned": list(self.FILLER)})
+        patcher = mock.patch.object(marvin, "api_request", self.fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def search(self, *words, **kw):
+        return run(marvin.cmd_search, query=list(words), all=kw.get("all", False))
+
+    def test_api_route_reports_the_cap_instead_of_claiming_nothing_matched(self):
+        for term in ("battle", "mythos", "site-leads"):
+            with self.subTest(term):
+                code, out = self.search(term)
+                self.assertIsNone(code, out)
+                self.assertIn("No tasks found", out)
+                self.assertIn(f"{marvin.CHILDREN_CAP}-item API cap hit", out)
+                self.assertIn("(uncategorized)", out)
+                self.assertIn("marvin setup", out)
+
+    def test_no_cap_warning_when_every_list_fits(self):
+        self.fake.children = {"unassigned": list(self.FILLER[:5])}
+        _, out = self.search("filler 1")
+        self.assertNotIn("API cap", out)
+
+    def test_sync_route_finds_every_hidden_task(self):
+        FakeSyncDB(self.FILLER + self.HIDDEN).install(self)
+        for term, title in (
+            ("battle", "battle.net"),
+            ("mythos", "Mythos company template audit"),
+            ("site-leads", "Send Tom the site-leads skill"),
+        ):
+            with self.subTest(term):
+                code, out = self.search(term)
+                self.assertIsNone(code, out)
+                self.assertIn(title, out)
+                self.assertNotIn("API cap", out)
+        self.assertEqual(self.fake.posts, [])
+
+    def test_sync_route_pages_until_the_database_is_exhausted(self):
+        many = [task(f"9{n:031x}", f"bulk {n} battle") for n in range(marvin.SYNC_PAGE * 2 + 7)]
+        db = FakeSyncDB(many).install(self)
+        _, out = self.search("bulk 1200 battle")
+        self.assertIn("bulk 1200 battle", out)
+        # Three full-ish pages, then one empty page to prove the end was reached.
+        self.assertEqual(len(db.calls), 4)
+        self.assertEqual([c[2]["bookmark"] for c in db.calls[1:]],
+                         [str(marvin.SYNC_PAGE), str(marvin.SYNC_PAGE * 2), str(len(many))])
+
+    def test_sync_database_is_read_once_per_run(self):
+        db = FakeSyncDB(self.HIDDEN).install(self)
+        first = marvin.sync_all_items()
+        reads = len(db.calls)
+        self.assertEqual(first, marvin.sync_all_items())
+        self.assertEqual(len(db.calls), reads)
+
+    def test_sync_route_leaves_done_tasks_out_unless_all_is_passed(self):
+        db = FakeSyncDB(self.HIDDEN + [task("f" * 32, "Old battle task", done=True)])
+        db.install(self)
+        _, out = self.search("battle")
+        self.assertNotIn("Old battle task", out)
+        _, out = self.search("battle", all=True)
+        self.assertIn("Old battle task", out)
+
+    def test_falls_back_to_all_docs_when_find_is_unavailable(self):
+        db = FakeSyncDB(self.HIDDEN + [{"_id": "z1", "db": "TimeData", "title": "mythos noise"}],
+                        find_fails=True).install(self)
+        _, out = self.search("mythos")
+        self.assertIn("Mythos company template audit", out)
+        self.assertNotIn("mythos noise", out)  # only Tasks and Categories count
+        self.assertTrue(any(c[1].endswith("/_all_docs") for c in db.calls))
+
+    def test_search_covers_tasks_left_on_a_past_day(self):
+        stale = task("c" * 32, "battle.net follow-up", day=YESTERDAY)
+        self.fake.upcoming = {YESTERDAY: [stale]}
+        _, out = self.search("battle.net")
+        self.assertIn("battle.net follow-up", out)
+        # Outside every pool resolve_task searches by prefix, so the full id shows.
+        self.assertIn("c" * 32, out)
+
+    def test_sync_route_keeps_tasks_that_have_no_done_field(self):
+        # Every fixture here is a doc with no done field, which is what a Mango
+        # {"done": {"$ne": True}} selector would have dropped.
+        db = FakeSyncDB(self.HIDDEN).install(self)
+        self.assertEqual(len(marvin.sync_all_items()), len(self.HIDDEN))
+        selectors = [call[2]["selector"] for call in db.calls]
+        self.assertTrue(all("done" not in s for s in selectors), selectors)
+
+    def test_all_docs_route_pages_past_one_server_page(self):
+        many = [task(f"{n:032x}", f"bulk {n}") for n in range(marvin.SYNC_PAGE * 2 + 37)]
+        FakeSyncDB(many, find_fails=True).install(self)
+        got = marvin.sync_all_items()
+        self.assertEqual(len(got), len(many))
+        ids = [d["_id"] for d in got]
+        self.assertEqual(len(set(ids)), len(ids))  # no key repeated by the overlap
+        self.assertEqual(set(ids), {d["_id"] for d in many})
+
+    def test_a_server_page_smaller_than_the_requested_limit_is_not_the_end(self):
+        many = [task(f"{n:032x}", f"bulk {n}") for n in range(31)]
+        for route in ({}, {"find_fails": True}):
+            with self.subTest(route=route or "_find"):
+                marvin._sync_cache.clear()
+                FakeSyncDB(many, page_size=7, **route).install(self)
+                self.assertEqual(len(marvin.sync_all_items()), len(many))
+
+    def test_a_failed_sync_read_still_shows_the_full_id_of_a_past_day_hit(self):
+        # Credentials configured but the read failed, so the API route is in
+        # use and a past-day prefix would not resolve.
+        stale = task("c" * 32, "battle.net follow-up", day=YESTERDAY)
+        self.fake.upcoming = {YESTERDAY: [stale]}
+        FakeSyncDB(self.HIDDEN, status=401).install(self)
+        _, out = self.search("battle.net")
+        self.assertIn("battle.net follow-up", out)
+        self.assertIn("c" * 32, out)
+        self.assertIn("Could not read the sync database (HTTP 401)", out)
+
+    def test_backlog_uses_the_sync_route_and_groups_by_category(self):
+        filed = task("a" * 32, "Mythos audit", parentId="cat1")
+        self.fake.categories = [{"_id": "cat1", "title": "Security"}]
+        FakeSyncDB(self.HIDDEN + [filed]).install(self)
+        code, out = run(marvin.cmd_backlog, uncategorized=False, subtasks=False)
+        self.assertIsNone(code, out)
+        self.assertIn("4 open task(s)", out)
+        self.assertIn("# Security  (1)", out)
+        self.assertIn("Mythos audit", out)
+        self.assertNotIn("API cap", out)
+
+
+class FakeResponse:
+    def __init__(self, status, payload=None):
+        self.status_code = status
+        self.payload = payload
+
+    def json(self):
+        if self.payload is None:
+            raise json.JSONDecodeError("no json", "", 0)
+        return self.payload
+
+
+class SyncHttpRetries(unittest.TestCase):
+    """What sync_http retries, and what it treats as a final answer."""
+
+    def setUp(self):
+        self.posts = []
+        self.gets = []
+        self.sleeps = []
+        for name, record in (("post", self.posts), ("get", self.gets)):
+            patcher = mock.patch.object(
+                marvin.requests, name,
+                lambda url, record=record, **kw: (record.append(url), self.reply)[1],
+            )
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(marvin.time, "sleep", self.sleeps.append)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch.object(
+            marvin, "sync_credentials", lambda: dict(FakeSyncDB.CREDS))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        marvin._sync_cache.clear()
+        self.addCleanup(marvin._sync_cache.clear)
+        marvin._sync_warned = False
+        self.addCleanup(setattr, marvin, "_sync_warned", False)
+
+    def test_a_rejected_credential_is_not_retried_and_the_failure_is_cached(self):
+        self.reply = FakeResponse(401)
+        code, out = run(lambda a: print(marvin.sync_all_items()), x=None)
+        self.assertIsNone(code, out)
+        # One _find, then one _all_docs fallback. No retry of either, no sleep.
+        self.assertEqual((len(self.posts), len(self.gets)), (1, 1))
+        self.assertEqual(self.sleeps, [])
+        self.assertIn("Could not read the sync database (HTTP 401)", out)
+        # Cached: the next helper in the same run re-reads nothing.
+        self.assertIsNone(marvin.sync_all_items())
+        self.assertEqual((len(self.posts), len(self.gets)), (1, 1))
+
+    def test_a_server_error_is_retried(self):
+        self.reply = FakeResponse(503)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(marvin.sync_all_items())
+        # Four attempts on _find, then four on the _all_docs fallback.
+        self.assertEqual((len(self.posts), len(self.gets)), (4, 4))
+        self.assertEqual(len(self.sleeps), 6)
+
+    def test_a_404_falls_back_to_all_docs_without_retrying_find(self):
+        self.reply = FakeResponse(404)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertIsNone(marvin.sync_all_items())
+        self.assertEqual((len(self.posts), len(self.gets)), (1, 1))
+
+
+class SyncCredentialHygiene(unittest.TestCase):
+    def setUp(self):
+        marvin._sync_cache.clear()
+        self.addCleanup(marvin._sync_cache.clear)
+        marvin._sync_warned = False
+        self.addCleanup(setattr, marvin, "_sync_warned", False)
+
+    def test_a_plain_http_sync_server_is_refused(self):
+        creds = dict(FakeSyncDB.CREDS, sync_server="http://sync.example.com")
+        with mock.patch.object(marvin, "load_config", lambda: creds), \
+             mock.patch.object(marvin, "sync_credentials", REAL_SYNC_CREDENTIALS):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertIsNone(marvin.sync_credentials())
+        self.assertIn("not an https:// URL", out.getvalue())
+
+    def test_config_is_written_at_0600(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            path = marvin.Path(tmp) / "nested" / "config.json"
+            with mock.patch.object(marvin, "CONFIG_DIR", path.parent), \
+                 mock.patch.object(marvin, "CONFIG_FILE", path):
+                marvin.save_config({"api_token": "t"})
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(json.loads(path.read_text()), {"api_token": "t"})
 
 
 if __name__ == "__main__":
