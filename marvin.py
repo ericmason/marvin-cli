@@ -249,6 +249,9 @@ SYNC_MAX_PAGES = 400
 # Item types a task search cares about: tasks, and the projects they sit in.
 SYNC_DBS = ["Tasks", "Categories"]
 _sync_warned = False
+# One command run reads the database at most once per done-ness, since two
+# helpers in the same run (resolution and a listing) both want everything.
+_sync_cache = {}
 
 
 def sync_credentials():
@@ -313,6 +316,8 @@ def sync_all_items(include_done=False):
     creds = sync_credentials()
     if not creds:
         return None
+    if include_done in _sync_cache:
+        return _sync_cache[include_done]
     auth = (creds["sync_user"], creds["sync_password"])
     base = f"{creds['sync_server'].rstrip('/')}/{creds['sync_database'].strip('/')}"
 
@@ -328,12 +333,15 @@ def sync_all_items(include_done=False):
             body["bookmark"] = bookmark
         data = sync_http("POST", f"{base}/_find", auth, body=body)
         if not isinstance(data, dict) or "docs" not in data:
-            return sync_all_docs(base, auth, include_done)
+            items = sync_all_docs(base, auth, include_done)
+            break
         docs = data["docs"]
         items.extend(docs)
         bookmark = data.get("bookmark")
         if len(docs) < SYNC_PAGE or not bookmark:
-            return items
+            break
+    if items is not None:
+        _sync_cache[include_done] = items
     return items
 
 

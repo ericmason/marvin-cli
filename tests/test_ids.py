@@ -479,6 +479,9 @@ class FakeSyncDB:
             patcher = mock.patch.object(marvin, name, value)
             patcher.start()
             testcase.addCleanup(patcher.stop)
+        # marvin caches one read per command run; each test is its own run.
+        marvin._sync_cache.clear()
+        testcase.addCleanup(marvin._sync_cache.clear)
         return self
 
     def matching(self, body):
@@ -608,6 +611,11 @@ class SearchPastTheApiCap(unittest.TestCase):
         self.assertEqual(len(db.calls), 3)
         self.assertEqual([c[2]["bookmark"] for c in db.calls[1:]],
                          [str(marvin.SYNC_PAGE), str(marvin.SYNC_PAGE * 2)])
+
+    def test_sync_database_is_read_once_per_run(self):
+        db = FakeSyncDB(self.HIDDEN).install(self)
+        self.assertEqual(marvin.sync_all_items(), marvin.sync_all_items())
+        self.assertEqual(len(db.calls), 1)
 
     def test_sync_route_leaves_done_tasks_out_unless_all_is_passed(self):
         db = FakeSyncDB(self.HIDDEN + [task("f" * 32, "Old battle task", done=True)])
