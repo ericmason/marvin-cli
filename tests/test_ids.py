@@ -811,5 +811,39 @@ class SyncCredentialHygiene(unittest.TestCase):
                 self.assertEqual(json.loads(path.read_text()), {"api_token": "t"})
 
 
+class TimeZoneOffset(unittest.TestCase):
+    """Marvin adds timeZoneOffset to UTC, so zones west of UTC are negative."""
+
+    def setUp(self):
+        self._tz = os.environ.get("TZ")
+
+    def tearDown(self):
+        if self._tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = self._tz
+        marvin.time.tzset()
+
+    def offset_in(self, zone):
+        os.environ["TZ"] = zone
+        marvin.time.tzset()
+        return marvin.get_tz_offset()
+
+    def test_sign_matches_marvin_docs(self):
+        self.assertEqual(self.offset_in("UTC"), 0)
+        self.assertEqual(self.offset_in("CST6"), -360)
+        self.assertEqual(self.offset_in("PST8"), -480)
+        self.assertEqual(self.offset_in("IST-5:30"), 330)
+
+    def test_add_sends_negative_offset_west_of_utc(self):
+        self.offset_in("CST6")
+        posts = []
+        with mock.patch.object(marvin, "api_request",
+                               side_effect=lambda m, e, d=None, **k: posts.append((e, d)) or {"_id": "x"}):
+            run(marvin.cmd_add, title=["Throwaway", "+today"], parent=None, day=None)
+        self.assertEqual(posts[0][0], "addTask")
+        self.assertEqual(posts[0][1]["timeZoneOffset"], -360)
+
+
 if __name__ == "__main__":
     unittest.main()

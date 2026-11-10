@@ -2263,9 +2263,15 @@ def cmd_skip_overdue(args):
 
 
 def get_tz_offset():
-    """Get timezone offset in minutes."""
+    """Minutes to add to UTC to get local time (-360 for CST, -480 for PST).
+
+    Marvin's addTask and markDone add this to the server's UTC time to find
+    the user's date, so it is the opposite sign of JavaScript's
+    getTimezoneOffset(). With the sign flipped, +today after 6 PM CST lands
+    on tomorrow.
+    """
     now = datetime.now(timezone.utc).astimezone()
-    return int(-now.utcoffset().total_seconds() / 60)
+    return int(now.utcoffset().total_seconds() / 60)
 
 
 def main():
