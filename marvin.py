@@ -2267,7 +2267,7 @@ def get_tz_offset():
 
     Marvin's addTask and markDone add this to the server's UTC time to find
     the user's date, so it is the opposite sign of JavaScript's
-    getTimezoneOffset(). With the sign flipped, +today after 6 PM CST lands
+    getTimezoneOffset(). With the sign flipped, +today after noon CST lands
     on tomorrow.
     """
     now = datetime.now(timezone.utc).astimezone()
