@@ -437,8 +437,8 @@ class DisplayIds(unittest.TestCase):
         self.assertEqual(uids[STRAY], STRAY)
         self.assertEqual(uids[OCT27], OCT27)
         self.assertEqual(uids["abcdef1234567890"], "abcdef12")
-        self.assertEqual(marvin.short_id(STRAY), STRAY)
-        self.assertEqual(marvin.short_id("abcdef1234567890"), "abcdef12")
+        self.assertEqual(marvin.fallback_id(STRAY), STRAY)
+        self.assertEqual(marvin.fallback_id("abcdef1234567890"), "abcdef1234567890")
 
 
 REAL_SYNC_CREDENTIALS = marvin.sync_credentials

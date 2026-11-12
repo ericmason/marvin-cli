@@ -90,6 +90,7 @@ marvin add "Fix tests" -p abc123    # Add a subtask under parent abc123
 marvin add "Deploy" -d next monday  # Schedule for a date
 
 marvin done abc123                  # Complete a task, project, or subtask
+marvin undone abc123                # Reopen a task or project marked done by mistake
 marvin estimate abc123 30           # Set a 30-minute estimate
 marvin move abc123 tomorrow         # Reschedule to another day
 marvin move abc123 --from 2026-07-21  # Also search a past day's list (one date)
@@ -220,8 +221,9 @@ fc365eada0d7d8efc3509e677c2f27d6   its child
 
 So a "short ID" is frequently ambiguous. The CLI handles that as follows:
 
-- **An ambiguous reference is an error, never a guess.** It prints every
-  candidate with an ID long enough to tell them apart, and exits non-zero.
+- **An ambiguous reference is an error, never a guess.** It prints every candidate on one line, full ID first and then the whole title, changes nothing, and exits non-zero. Re-run with the full ID of the task you mean.
+- **Don't shorten IDs yourself.** An ID you cut to 8 characters, or an error you trimmed with `| tail`, can name a different task than the one you meant.
+- **`marvin undone <id>` reopens a task marked done by mistake.** A prefix is matched only among tasks completed in the last 14 days; a full ID reaches any completed task.
 - **An exact ID always wins** over a prefix match.
 - **Displayed IDs are lengthened as needed** so anything the CLI prints can be
   pasted straight back into another command.
