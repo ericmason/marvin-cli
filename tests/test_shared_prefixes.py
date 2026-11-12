@@ -250,6 +250,31 @@ class Undone(unittest.TestCase):
         self.assertIn("No completed task found", out)
         self.assertEqual(self.fake.posts, [])
 
+    def test_prefix_shared_with_embedded_subtask_is_refused(self):
+        sub_id = "605a9bf663c9e42e1074976da8e3c999"
+        self.access["subtasks"] = {"k1": {"_id": sub_id, "title": "Embedded step", "done": True}}
+        code, out = self.undone("605a9bf663c9e42e1074976da8e3c")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.fake.posts, [])
+        self.assertIn(f"  {ACCESS}  {ACCESS_TITLE}", out)
+        self.assertIn(f"  {sub_id}  Embedded step", out)
+
+    def test_embedded_subtask_full_id_is_refused(self):
+        sub_id = "605a9bf663c9e42e1074976da8e3c999"
+        self.access["subtasks"] = {"k1": {"_id": sub_id, "title": "Embedded step", "done": True}}
+        code, out = self.undone(sub_id)
+        self.assertEqual(code, 1)
+        self.assertEqual(self.fake.posts, [])
+        self.assertIn("is a subtask inside", out)
+
+    def test_category_is_refused(self):
+        cat_id = "c" * 32
+        self.fake.docs[cat_id] = {"_id": cat_id, "title": "Work", "type": "category", "done": True}
+        code, out = self.undone(cat_id)
+        self.assertEqual(code, 1)
+        self.assertIn("is a category", out)
+        self.assertEqual(self.fake.posts, [])
+
     def test_recurring_template_is_refused(self):
         tmpl_id = "628bcfd6-85e9-4925-bdac-019bcafd2560"
         self.fake.docs[tmpl_id] = {"_id": tmpl_id, "title": "Review PRs", "db": "RecurringTasks", "done": True}

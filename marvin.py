@@ -532,7 +532,7 @@ def exit_ambiguous(task_ref, matches, action=None, recurring=False):
     Marvin ids created in the same session share a long common prefix, so a short
     ref regularly matches several unrelated tasks (and a task's own children).
     Silently picking one is how the wrong task gets completed or moved, so this
-    prints every candidate with an id long enough to tell them apart.
+    prints every candidate's full id on the same line as its title.
 
     recurring=True means the ref names a recurring task's shared uuid, which
     matches every instance of it, not only the ones listed.
@@ -1256,6 +1256,20 @@ def cmd_undone(args):
         item = doc_get(task_ref)
     if item is None:
         pool = completed_task_pool()
+        # An embedded subtask shares its parent's id prefix but lives inside
+        # the parent's doc, so a prefix reaching one must never reopen the
+        # parent. Reopening the subtask itself isn't supported: refuse.
+        subs = find_embedded_subtasks(task_ref, pool)
+        if subs:
+            task_hits = [i for i in pool if ref_matches(i, task_ref)]
+            if len(subs) + len(task_hits) > 1:
+                exit_ambiguous(task_ref, task_hits + [sub for _, _, sub in subs],
+                               action="marvin undone")
+            parent, _, sub = subs[0]
+            print(f"'{sub.get('title', 'Untitled')}' is a subtask inside "
+                  f"'{parent.get('title', 'Untitled')}'; 'marvin undone' reopens "
+                  f"only tasks and projects. Reopen the subtask in the Marvin app.")
+            sys.exit(1)
         if not any(ref_matches(i, task_ref) for i in pool):
             print(f"No completed task found matching '{task_ref}'.")
             print(f"Searched tasks completed in the last {UNDONE_SCAN_DAYS} days; "
