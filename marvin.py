@@ -532,39 +532,31 @@ def exit_ambiguous(task_ref, matches, action=None, recurring=False):
     Marvin ids created in the same session share a long common prefix, so a short
     ref regularly matches several unrelated tasks (and a task's own children).
     Silently picking one is how the wrong task gets completed or moved, so this
-    prints every candidate with an id long enough to tell them apart.
+    prints every candidate's full id on the same line as its title.
 
     recurring=True means the ref names a recurring task's shared uuid, which
     matches every instance of it, not only the ones listed.
     """
-    uids = unique_ids(matches)
     if recurring:
         print(f"Ambiguous task ref '{task_ref}' — it names a recurring task, and "
               f"every instance of it shares that id. Instances found:")
     else:
         print(f"Ambiguous task ref '{task_ref}' — matches {len(matches)} tasks:")
+    # One line per candidate, full id first and whole title after it, so an id
+    # can never be read apart from the task it names — even through `| tail`.
     for m in matches:
-        full_id = m.get("_id", "")
-        # A shortest-unique prefix can't separate recurring instances (they share
-        # one uuid), so those fall back to the full compound id.
-        shown = uids.get(full_id, "")
-        if sum(1 for o in matches if matchable_id(o.get("_id", "")).startswith(shown)) > 1:
-            shown = full_id
-        title = m.get("title", "Untitled")
-        if len(title) > 60:
-            title = title[:57] + "..."
         day = m.get("day", "")
         meta = f"  sched:{day}" if day and day != "unassigned" else ""
         due = m.get("dueDate", "")
         meta += f"  due:{due}" if due else ""
-        print(f"  • {title}{meta}")
-        print(f"      {shown}")
+        print(f"  {m.get('_id', '')}  {m.get('title', 'Untitled')}{meta}")
     verb = action or "Re-run"
     if recurring:
-        print(f"\n{verb} with the dated id of the instance you mean "
+        print(f"Nothing was changed. {verb} with the dated id of the instance you mean "
               f"(<YYYY-MM-DD>_<uuid>, as shown above).")
     else:
-        print(f"\n{verb} with one of the ids above (a longer prefix is enough).")
+        print(f"Nothing was changed. {verb} with the full id of the task you mean, "
+              f"from the {len(matches)} above.")
     sys.exit(1)
 
 
@@ -661,18 +653,14 @@ def gather_items(*sources):
     return result
 
 
-def short_id(raw_id):
-    """Extract a consistent 8-character short ID from a raw task/subtask ID.
+def fallback_id(raw_id):
+    """The id to show for an item missing from a listing's display_ids() map.
 
-    A recurring instance ('2026-03-31_<uuid>') gets its full id: every instance
-    of the task shares the uuid, so no shortened form names just that instance.
-
-    Prefer unique_ids()/display_ids() when showing a list: 8 characters is often
-    not unique in this account, so a bare short id can't safely be pasted back.
+    The full id: a fixed-length prefix is often shared by another task (Marvin
+    ids created together match for ~30 characters), so only the whole id is
+    safe to paste back when uniqueness wasn't computed.
     """
-    if raw_id and raw_id != matchable_id(raw_id):
-        return raw_id
-    return raw_id[:8]
+    return raw_id
 
 
 def doc_get(doc_id):
@@ -859,7 +847,7 @@ def format_task(item, uids=None):
     done = "✓" if item.get("done") else "○"
     title = item.get("title", "Untitled")
     raw_id = item.get("_id", "")
-    sid = (uids or {}).get(raw_id) or short_id(raw_id)
+    sid = (uids or {}).get(raw_id) or fallback_id(raw_id)
     time_est = item.get("timeEstimate")
     time_str = f" [{time_est // 60000}m]" if time_est else ""
     return done, title, time_str, sid
@@ -886,11 +874,25 @@ def unique_ids(items):
         if is_recurring_instance(item):
             out[raw_id] = raw_id
             continue
-        n = 8
-        while n < len(form) and sum(1 for f in forms if f.startswith(form[:n])) > 1:
-            n += 1
-        out[raw_id] = form[:max(8, n)]
+        out[raw_id] = shortest_unique_prefix(form, forms)
     return out
+
+
+def shortest_unique_prefix(form, forms, minimum=8):
+    """The shortest prefix of form (at least `minimum` chars) that no other entry
+    in forms starts with. An id that another entry fully contains, or a genuine
+    duplicate, comes back whole."""
+    n = minimum
+    while n < len(form) and sum(1 for f in forms if f.startswith(form[:n])) > 1:
+        n += 1
+    return form[:n]
+
+
+def unique_plain_ids(items):
+    """Map each item's _id to its shortest unique prefix among items, for lists
+    of categories and labels, whose ids have no recurring form."""
+    ids = [i.get("_id", "") for i in items]
+    return {raw: shortest_unique_prefix(raw, ids) for raw in ids}
 
 
 def nested_child_ids(items):
@@ -1120,7 +1122,7 @@ def show_tasks_for_date(date_str, show_incomplete_only=False, include_completed=
                 sub_done = "✓" if subtask.get("done") else "○"
                 sub_title = subtask.get("title", "Untitled")
                 raw = subtask.get("_id", "")
-                sub_sid = uids.get(raw) or short_id(raw)
+                sub_sid = uids.get(raw) or fallback_id(raw)
                 print(f"      {sub_done} {sub_title}  ({sub_sid})")
 
     if hidden_count:
@@ -1230,6 +1232,74 @@ def cmd_done(args):
     sys.exit(1)
 
 
+UNDONE_SCAN_DAYS = 14
+
+
+def completed_task_pool(days=UNDONE_SCAN_DAYS):
+    """Tasks completed on each of the last `days` days, today included."""
+    today = datetime.now().date()
+    dates = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+
+    def fetch_day(date_str):
+        return api_request(
+            "GET", "doneItems", {"date": date_str}, full_access=True, tolerant=True
+        )
+
+    return fetch_all_or_exit(fetch_day, dates, "the completed list for")
+
+
+def cmd_undone(args):
+    """Reopen a completed task or project, undoing a mistaken 'marvin done'."""
+    task_ref = args.task_id
+    item = None
+    if is_full_length_id(task_ref):
+        item = doc_get(task_ref)
+    if item is None:
+        pool = completed_task_pool()
+        # An embedded subtask shares its parent's id prefix but lives inside
+        # the parent's doc, so a prefix reaching one must never reopen the
+        # parent. Reopening the subtask itself isn't supported: refuse.
+        subs = find_embedded_subtasks(task_ref, pool)
+        if subs:
+            task_hits = [i for i in pool if ref_matches(i, task_ref)]
+            if len(subs) + len(task_hits) > 1:
+                exit_ambiguous(task_ref, task_hits + [sub for _, _, sub in subs],
+                               action="marvin undone")
+            parent, _, sub = subs[0]
+            print(f"'{sub.get('title', 'Untitled')}' is a subtask inside "
+                  f"'{parent.get('title', 'Untitled')}'; 'marvin undone' reopens "
+                  f"only tasks and projects. Reopen the subtask in the Marvin app.")
+            sys.exit(1)
+        if not any(ref_matches(i, task_ref) for i in pool):
+            print(f"No completed task found matching '{task_ref}'.")
+            print(f"Searched tasks completed in the last {UNDONE_SCAN_DAYS} days; "
+                  f"pass the full id for one completed earlier.")
+            sys.exit(1)
+        # A prefix is matched only among completed tasks: an open task that
+        # shares it is not a candidate for reopening.
+        item = find_task_by_ref(task_ref, pool, probe_children=False)
+    refuse_recurring_template(item)
+    title = item.get("title", "Untitled")
+    if item.get("type") == "category":
+        print(f"'{title}' is a category; only tasks and projects can be reopened.")
+        sys.exit(1)
+    if not item.get("done"):
+        print(f"'{title}' is not done; nothing to reopen.")
+        sys.exit(1)
+    now = int(datetime.now().timestamp() * 1000)
+    api_request("POST", "doc/update", {
+        "itemId": item["_id"],
+        "setters": [
+            {"key": "done", "val": False},
+            {"key": "doneAt", "val": None},
+            {"key": "fieldUpdates.done", "val": now},
+            {"key": "updatedAt", "val": now},
+        ],
+    }, full_access=True)
+    print(f"✓ Reopened: {title}")
+    print(f"  ID: {item['_id']}")
+
+
 def cmd_completed(args):
     """List completed tasks from the last N days."""
     days = args.days
@@ -1295,7 +1365,7 @@ def cmd_completed(args):
             ):
                 if sub.get("done"):
                     sub_title = sub.get("title", "Untitled")
-                    sub_sid = uids.get(sub.get("_id", "")) or short_id(sub.get("_id", ""))
+                    sub_sid = uids.get(sub.get("_id", "")) or fallback_id(sub.get("_id", ""))
                     print(f"      ✓ {sub_title}  ({sub_sid})")
                     total += 1
 
@@ -1384,7 +1454,7 @@ def cmd_subtasks(args):
     for sub in embedded:
         sub_done = "✓" if sub.get("done") else "○"
         sub_title = sub.get("title", "Untitled")
-        sub_sid = uids.get(sub.get("_id", "")) or short_id(sub.get("_id", ""))
+        sub_sid = uids.get(sub.get("_id", "")) or fallback_id(sub.get("_id", ""))
         print(f"  {sub_done} {sub_title}  ({sub_sid})")
 
     total = len(children) + len(embedded)
@@ -1490,10 +1560,10 @@ def cmd_projects(args):
     print("Categories/Projects:")
     print("-" * 40)
 
+    uids = unique_plain_ids(items)
     for item in items:
         title = item.get("title", "Untitled")
-        cat_id = item.get("_id", "")[:8]
-        print(f"  # {title}  ({cat_id})")
+        print(f"  # {title}  ({uids[item.get('_id', '')]})")
 
 
 def cmd_labels(args):
@@ -1507,14 +1577,14 @@ def cmd_labels(args):
     print("Labels:")
     print("-" * 40)
 
+    uids = unique_plain_ids(items)
     for item in items:
         title = item.get("title", "Untitled")
-        label_id = item.get("_id", "")[:8]
-        print(f"  @ {title}  ({label_id})")
+        print(f"  @ {title}  ({uids[item.get('_id', '')]})")
 
 
 def resolve_category(ref):
-    """Resolve a category/project by name or 8-char id prefix.
+    """Resolve a category/project by name or id prefix.
 
     Matches, in priority order: exact (case-insensitive) title, then id prefix,
     then title substring. Returns the matched category dict, or None after
@@ -1537,7 +1607,7 @@ def resolve_category(ref):
         return None
     print(f"Ambiguous '{ref}' — matches {len(matches)}:")
     for c in matches:
-        print(f"  # {c.get('title', 'Untitled')}  ({c.get('_id', '')[:8]})")
+        print(f"  {c.get('_id', '')}  # {c.get('title', 'Untitled')}")
     return None
 
 
@@ -2056,7 +2126,7 @@ def cmd_search(args):
     for parent_title, sub in subtask_matches:
         sub_done = "✓" if sub.get("done") else "○"
         sub_title = sub.get("title", "Untitled")
-        sub_sid = uids.get(sub.get("_id", "")) or short_id(sub.get("_id", ""))
+        sub_sid = uids.get(sub.get("_id", "")) or fallback_id(sub.get("_id", ""))
         print(f"      {sub_done} {sub_title}  ({sub_sid})  [in: {parent_title}]")
 
     warn_capped(capped)
@@ -2135,10 +2205,7 @@ def cmd_reorder(args):
             if len(matches) == 1:
                 ordered_items.append(next(iter(matches.values())))
             elif len(matches) > 1:
-                print(f"Ambiguous task ref '{ref}' - matches multiple tasks:")
-                for mid in matches:
-                    print(f"      {mid}")
-                sys.exit(1)
+                exit_ambiguous(ref, list(matches.values()), action="marvin reorder")
             else:
                 print(f"No task found matching '{ref}'")
                 sys.exit(1)
@@ -2238,7 +2305,7 @@ def cmd_skip_overdue(args):
     for master_id, dates in masters.items():
         doc = api_request("GET", "doc", {"id": master_id}, full_access=True, tolerant=True)
         if not isinstance(doc, dict) or not doc.get("_id"):
-            print(f"  ! Could not read master {master_id[:8]} — its instances may reappear.")
+            print(f"  ! Could not read master {master_id} — its instances may reappear.")
             continue
         current = doc.get("deletedDates") or []
         merged = sorted(set(current) | dates)
@@ -2403,6 +2470,11 @@ Date formats for 'day' command:
     sub.add_argument("task_id", help="Task or subtask ID (or prefix)")
     sub.set_defaults(func=cmd_done)
 
+    # undone
+    sub = subparsers.add_parser("undone", help="Reopen a completed task (undo 'marvin done')")
+    sub.add_argument("task_id", help="Task ID (or prefix) of a task completed in the last 14 days, or any full ID")
+    sub.set_defaults(func=cmd_undone)
+
     # subtasks
     sub = subparsers.add_parser("subtasks", help="List subtasks of a task")
     sub.add_argument("task_id", help="Parent task ID (or prefix)")
@@ -2442,7 +2514,7 @@ Date formats for 'day' command:
 
     # category
     sub = subparsers.add_parser("category", help="List tasks in a category/project")
-    sub.add_argument("name", nargs="+", help="Category/project name or 8-char id")
+    sub.add_argument("name", nargs="+", help="Category/project name or the id 'marvin projects' prints")
     sub.add_argument("--all", "-a", action="store_true", help="Include completed tasks")
     sub.add_argument("--subtasks", "-S", action="store_true",
                      help="Also list each task's child tasks (1 request per task)")
