@@ -31,7 +31,7 @@ ACCESS_TITLE = ("Store the reason for each access exception in Hourglass, tied t
 TODAY = marvin.datetime.now().strftime("%Y-%m-%d")
 YESTERDAY = (marvin.datetime.now().date() - marvin.timedelta(days=1)).isoformat()
 
-ROW_ID = re.compile(r"\(([0-9a-f]{8,}|\d{4}-\d{2}-\d{2}_[0-9a-f-]+)\)")
+ROW_ID = re.compile(r"\(([0-9a-f]{8}\.\.[0-9a-f]{6}|[0-9a-f]{8,}|\d{4}-\d{2}-\d{2}_[0-9a-f-]+)\)")
 
 
 class DoneAwareMarvin(FakeMarvin):
@@ -69,7 +69,7 @@ class ListingIdsAreUnique(unittest.TestCase):
         self.assertEqual(len(shown), len(full_ids), out)
         self.assertEqual(len(set(shown)), len(shown), f"duplicate ids in:\n{out}")
         for sid in shown:
-            hits = [f for f in full_ids if f.startswith(sid)]
+            hits = [f for f in full_ids if marvin.id_matches_ref(f, sid)]
             self.assertEqual(len(hits), 1, f"{sid} names {hits} in:\n{out}")
         self.assertNotIn("(605a9bf6)", out)
 
@@ -85,9 +85,9 @@ class ListingIdsAreUnique(unittest.TestCase):
         fake = DoneAwareMarvin(today=items, upcoming={TODAY: items})
         out = self.listing(marvin.cmd_today, fake, date=None, all=False, snoozed=False, subtasks=False)
         self.assert_unique_rows(out, [NELSON, ACCESS, OTHER])
-        self.assertIn("(605a9bf663c9e42e1074976da8e3b)", out)
-        self.assertIn("(605a9bf663c9e42e1074976da8e3c)", out)
-        self.assertIn("(605a9bf6f)", out)
+        self.assertIn("(605a9bf6..e3b4c6)", out)
+        self.assertIn("(605a9bf6..e3c1c9)", out)
+        self.assertIn("(605a9bf6..ffffff)", out)
         out = self.listing(marvin.cmd_day, fake, date=["today"], incomplete=False, all=False,
                            snoozed=False, subtasks=False)
         self.assert_unique_rows(out, [NELSON, ACCESS, OTHER])
@@ -191,6 +191,60 @@ class AmbiguityError(unittest.TestCase):
             out = run(lambda a: marvin.resolve_category("605a9bf6"))[1]
         self.assertIn(f"  {NELSON}  # Work", out)
         self.assertIn(f"  {ACCESS}  # Security", out)
+
+
+class ShownIdResolvesBeyondTheListing(unittest.TestCase):
+    """From the 11/18 report: search printed (358383c9) for one task, and
+    `marvin done 358383c9` refused it because two tasks the search didn't show
+    share the prefix. The printed id must name one task among all of them."""
+
+    IDS = ["358383c985145d8d16342b55d87c61c9",
+           "358383c985145d8d16342b55d87c6b27",
+           "358383c985145d8d16342b55d87c705e"]
+    TITLES = ["Renew the API token", "Re-link the card login", "Gather tax receipts"]
+
+    def setUp(self):
+        self.items = [task(i, t, TODAY) for i, t in zip(self.IDS, self.TITLES)]
+        self.fake = DoneAwareMarvin(today=self.items, upcoming={TODAY: self.items})
+        for patcher in (mock.patch.object(marvin, "api_request", self.fake),
+                        mock.patch.object(marvin, "sync_all_items", lambda *a, **k: None)):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def shown_ids(self, query):
+        with mock.patch.object(marvin, "search_pool",
+                               lambda include_done=False: (self.items, [], True)):
+            code, out = run(marvin.cmd_search, query=[query], all=False)
+        self.assertIsNone(code, out)
+        return ROW_ID.findall(out)
+
+    def test_each_search_hit_completes_its_own_task(self):
+        for full_id, title in zip(self.IDS, self.TITLES):
+            with self.subTest(title):
+                shown = self.shown_ids(title)
+                self.assertEqual(shown, [f"358383c9..{full_id[-6:]}"])
+                self.fake.posts = []
+                code, out = run(marvin.cmd_done, task_id=shown[0])
+                self.assertIsNone(code, out)
+                self.assertEqual(self.fake.posts[0][1]["itemId"], full_id)
+
+    def test_shown_form_matches_one_id(self):
+        for full_id in self.IDS:
+            ref = f"{full_id[:8]}..{full_id[-6:]}"
+            self.assertEqual([i for i in self.IDS if marvin.id_matches_ref(i, ref)], [full_id])
+        self.assertFalse(marvin.id_matches_ref("358383c9", "358383c9..c61c9"))
+
+    def test_reorder_accepts_the_shown_form(self):
+        self.fake.posts = []
+        code, out = run(marvin.cmd_reorder, task_ids=["358383c9..7c6b27"])
+        self.assertNotIn("Ambiguous", out)
+        self.assertNotIn("No task found", out)
+        self.assertIn(self.IDS[1], repr(self.fake.posts), out)
+
+    def test_category_lookup_accepts_the_shown_form(self):
+        cats = [{"_id": i, "title": t} for i, t in zip(self.IDS, self.TITLES)]
+        with mock.patch.object(marvin, "api_request", DoneAwareMarvin(categories=cats)):
+            self.assertEqual(marvin.resolve_category("358383c9..7c705e")["_id"], self.IDS[2])
 
 
 class Undone(unittest.TestCase):

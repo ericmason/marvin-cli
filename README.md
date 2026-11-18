@@ -206,9 +206,7 @@ Commands that take a date accept `YYYY-MM-DD` or natural language:
 
 ## How task IDs work
 
-Listings show an ID in parentheses, e.g. `(abc12345)`, and any command that takes
-a task ID accepts it. That ID is **the shortest prefix that is unique within the
-list you are looking at — not a fixed 8 characters.**
+Listings show an ID in parentheses as its first 8 and last 6 characters, e.g. `(358383c9..7c6b27)`, and any command that takes a task ID accepts it. Because the last characters are where Marvin IDs differ, that form matches one task across the whole account, not just within the list you are looking at. If it ever matched two, the command would refuse it as ambiguous, as with any ID. If another task in the same list would match it, the listing shows the full ID instead.
 
 This matters because Marvin IDs created in the same session share a long common
 prefix and differ only near the end. Real example: a parent task and one of its
@@ -225,8 +223,7 @@ So a "short ID" is frequently ambiguous. The CLI handles that as follows:
 - **Don't shorten IDs yourself.** An ID you cut to 8 characters, or an error you trimmed with `| tail`, can name a different task than the one you meant.
 - **`marvin undone <id>` reopens a task marked done by mistake.** A prefix is matched only among tasks completed in the last 14 days; a full ID reaches any completed task.
 - **An exact ID always wins** over a prefix match.
-- **Displayed IDs are lengthened as needed** so anything the CLI prints can be
-  pasted straight back into another command.
+- **Anything the CLI prints can be pasted straight back into another command**, including the `first..last` form. A plain prefix still works too.
 - **Child tasks reached through `subtasks` / `-S` are shown with their full ID.**
   A task nested under another task is in no day list and is not a direct child of
   any category, so it can only be resolved by an exact ID lookup — a shortened
