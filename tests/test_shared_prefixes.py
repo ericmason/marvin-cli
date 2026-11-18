@@ -235,9 +235,16 @@ class ShownIdResolvesBeyondTheListing(unittest.TestCase):
         self.assertFalse(marvin.id_matches_ref("358383c9", "358383c9..c61c9"))
 
     def test_reorder_accepts_the_shown_form(self):
+        self.fake.posts = []
         code, out = run(marvin.cmd_reorder, task_ids=["358383c9..7c6b27"])
         self.assertNotIn("Ambiguous", out)
         self.assertNotIn("No task found", out)
+        self.assertIn(self.IDS[1], repr(self.fake.posts), out)
+
+    def test_category_lookup_accepts_the_shown_form(self):
+        cats = [{"_id": i, "title": t} for i, t in zip(self.IDS, self.TITLES)]
+        with mock.patch.object(marvin, "api_request", DoneAwareMarvin(categories=cats)):
+            self.assertEqual(marvin.resolve_category("358383c9..7c705e")["_id"], self.IDS[2])
 
 
 class Undone(unittest.TestCase):

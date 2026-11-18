@@ -1615,7 +1615,7 @@ def resolve_category(ref):
     exact = [c for c in cats if c.get("title", "").lower() == ref_l]
     if len(exact) == 1:
         return exact[0]
-    byid = [c for c in cats if c.get("_id", "").startswith(ref)]
+    byid = [c for c in cats if id_matches_ref(c.get("_id", ""), ref)]
     if len(byid) == 1:
         return byid[0]
     subs = [c for c in cats if ref_l in c.get("title", "").lower()]
