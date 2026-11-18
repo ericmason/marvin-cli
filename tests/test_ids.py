@@ -283,7 +283,7 @@ class PastDaysDigitIdsAndMoveFrom(unittest.TestCase):
 
     def test_upcoming_day_listing_keeps_the_short_id(self):
         self.fake.upcoming = {IN_TWO_DAYS: [self.old]}
-        self.assertEqual(self.shown_id(IN_TWO_DAYS), "02b9e38f")
+        self.assertEqual(self.shown_id(IN_TWO_DAYS), "02b9e38f..4f5a6b")
 
     def test_every_command_resolves_the_id_a_past_day_listing_prints(self):
         ref = self.shown_id(PAST_DAY)
@@ -357,7 +357,7 @@ class PastDaysDigitIdsAndMoveFrom(unittest.TestCase):
                         snoozed=False, subtasks=False)
         self.assertIsNone(code, out)
         self.assertIn(f"({self.old['_id']})", out)
-        self.assertIn("(f00dfeed)", out)
+        self.assertIn("(f00dfeed..000000)", out)
 
     def test_move_from_takes_one_date_in_any_position(self):
         target = IN_TWO_DAYS
@@ -408,7 +408,8 @@ class DoneByListNumber(unittest.TestCase):
             head = line.strip().split(". ", 1)
             if head[0].isdigit():
                 shown[head[0]] = line.rsplit("(", 1)[1].rstrip(")")
-        self.assertEqual(list(shown.values()), ["8326f130", "d5000000", "b3f81f9e"])
+        self.assertEqual(list(shown.values()),
+                         ["8326f130..000000", "d5000000..000000", "b3f81f9e..000000"])
         by_id = {t["_id"]: t for t in self.listed}
         for number, sid in shown.items():
             with self.subTest(number):
@@ -416,7 +417,7 @@ class DoneByListNumber(unittest.TestCase):
                 code, out = run(marvin.cmd_done, task_id=number)
                 self.assertIsNone(code, out)
                 done_id = self.fake.posts[0][1]["itemId"]
-                self.assertTrue(done_id.startswith(sid), (number, done_id))
+                self.assertTrue(marvin.id_matches_ref(done_id, sid), (number, done_id))
                 self.assertIn(done_id, by_id)
 
     def test_number_past_the_list_is_refused_even_when_it_prefixes_an_id(self):
@@ -432,11 +433,21 @@ class DoneByListNumber(unittest.TestCase):
 
 class DisplayIds(unittest.TestCase):
     def test_recurring_instances_display_their_full_id(self):
-        items = [task(STRAY, "a"), task(OCT27, "b"), task("abcdef1234567890", "c")]
+        long_id = "abcdef12" + "0" * 18 + "a1b2c3"
+        items = [task(STRAY, "a"), task(OCT27, "b"), task("abcdef1234567890", "c"),
+                 task(long_id, "d")]
         uids = marvin.unique_ids(items)
         self.assertEqual(uids[STRAY], STRAY)
         self.assertEqual(uids[OCT27], OCT27)
-        self.assertEqual(uids["abcdef1234567890"], "abcdef12")
+        # Too short to shorten: shown whole.
+        self.assertEqual(uids["abcdef1234567890"], "abcdef1234567890")
+        self.assertEqual(uids[long_id], "abcdef12..a1b2c3")
+
+    def test_shown_form_falls_back_to_full_id_when_another_item_matches_it(self):
+        a = "abcdef12" + "0" * 18 + "a1b2c3"
+        b = "abcdef12" + "f" * 18 + "a1b2c3"
+        uids = marvin.unique_ids([task(a, "a"), task(b, "b")])
+        self.assertEqual(uids, {a: a, b: b})
         self.assertEqual(marvin.fallback_id(STRAY), STRAY)
         self.assertEqual(marvin.fallback_id("abcdef1234567890"), "abcdef1234567890")
 

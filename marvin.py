@@ -520,10 +520,25 @@ def matchable_id(raw_id):
     return raw_id.split("_", 1)[-1] if "_" in raw_id else raw_id
 
 
+ID_HEAD = 8
+ID_TAIL = 6
+
+
+def id_matches_ref(raw_id, task_ref):
+    """True if task_ref names raw_id: a prefix of it, or the '<first>..<last>'
+    form listings print (e.g. '358383c9..7c6b27' for an id that starts with
+    358383c9 and ends with 7c6b27)."""
+    if ".." in task_ref:
+        head, _, tail = task_ref.partition("..")
+        return (len(raw_id) >= len(head) + len(tail)
+                and raw_id.startswith(head) and raw_id.endswith(tail))
+    return raw_id.startswith(task_ref)
+
+
 def ref_matches(item, task_ref):
-    """True if task_ref is a prefix of the item's full id or its matchable form."""
+    """True if task_ref names the item's full id or its matchable form."""
     full_id = item.get("_id", "")
-    return full_id.startswith(task_ref) or matchable_id(full_id).startswith(task_ref)
+    return id_matches_ref(full_id, task_ref) or id_matches_ref(matchable_id(full_id), task_ref)
 
 
 def exit_ambiguous(task_ref, matches, action=None, recurring=False):
@@ -614,7 +629,7 @@ def matches_recurring_uuid_only(item, task_ref):
     Every instance of a recurring task carries the same uuid, so such a ref is
     ambiguous by nature: the instances a caller can see are not all there are.
     """
-    return is_recurring_instance(item) and not item.get("_id", "").startswith(task_ref)
+    return is_recurring_instance(item) and not id_matches_ref(item.get("_id", ""), task_ref)
 
 
 def is_full_length_id(task_ref):
@@ -841,8 +856,8 @@ def resolve_task(task_ref, extra_items=None, include_done=True, allow_deep=True)
 def format_task(item, uids=None):
     """Format a task for display. Returns (done_marker, title, time_str, id).
 
-    Pass the map from display_ids()/unique_ids() so the shown id is unique within
-    the list being printed and can therefore be pasted back into another command.
+    Pass the map from display_ids()/unique_ids() so the shown id names one task
+    and can therefore be pasted back into another command.
     """
     done = "✓" if item.get("done") else "○"
     title = item.get("title", "Untitled")
@@ -854,27 +869,32 @@ def format_task(item, uids=None):
 
 
 def unique_ids(items):
-    """Map each item's _id to the shortest prefix (>= 8 chars) that is unique
-    among `items`, computed over the same matchable form find_task_by_ref uses
-    (the part after '_' for recurring instances).
+    """Map each item's _id to the id a listing shows for it: the first 8 and
+    last 6 characters joined by '..' (e.g. '358383c9..7c6b27'), which every
+    command that takes a task ref accepts.
 
-    Marvin ids for bulk-created tasks share a long common prefix and differ only
-    at the end, so a fixed 8-char id collides. Displaying a context-unique prefix
-    keeps the shown id both readable and usable as a task ref. Genuine duplicate
-    ids fall back to the full form.
+    Marvin ids for tasks created together share a long common prefix and differ
+    only at the end, so any prefix that is unique within one listing can still
+    match tasks the listing didn't show, and `marvin done` then refuses it as
+    ambiguous. The last characters are where those ids differ, so a shown id
+    that includes them names one task across the whole account, not just within
+    the list. If another item in `items` would still match the shown form, or
+    the id is too short to shorten, the full id is shown.
 
     A recurring instance is always shown by its full '<YYYY-MM-DD>_<uuid>' id.
     Its uuid is shared with every other instance of the task, in this list or
     not, so any shortened form would name all of them.
     """
-    forms = [matchable_id(i.get("_id", "")) for i in items]
     out = {}
-    for item, form in zip(items, forms):
+    for item in items:
         raw_id = item.get("_id", "")
-        if is_recurring_instance(item):
+        if is_recurring_instance(item) or len(raw_id) <= ID_HEAD + 2 + ID_TAIL:
             out[raw_id] = raw_id
             continue
-        out[raw_id] = shortest_unique_prefix(form, forms)
+        short = f"{raw_id[:ID_HEAD]}..{raw_id[-ID_TAIL:]}"
+        clash = any(ref_matches(other, short) for other in items
+                    if other.get("_id", "") != raw_id)
+        out[raw_id] = raw_id if clash else short
     return out
 
 
@@ -1141,7 +1161,7 @@ def find_embedded_subtasks(task_ref, items):
             continue
         for key, sub in embedded.items():
             sub_id = sub.get("_id", "")
-            if sub_id.startswith(task_ref) or key.startswith(task_ref):
+            if id_matches_ref(sub_id, task_ref) or id_matches_ref(key, task_ref):
                 found.append((item, key, sub))
     return found
 
@@ -2200,7 +2220,7 @@ def cmd_reorder(args):
             matches = {
                 item["_id"]: item
                 for item in items
-                if item.get("_id", "").startswith(ref)
+                if id_matches_ref(item.get("_id", ""), ref)
             }
             if len(matches) == 1:
                 ordered_items.append(next(iter(matches.values())))
